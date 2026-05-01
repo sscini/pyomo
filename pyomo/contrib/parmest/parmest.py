@@ -476,156 +476,6 @@ def L2_regularized_objective(
     return l2reg_objective
 
 
-def _calculate_L1_smooth_penalty(
-    model, prior_FIM, theta_ref=None, regularization_epsilon=1e-6
-):
-    """
-    Calculates smooth L1 penalty:
-    sum_i w_i*sqrt((theta_i - theta_ref_i)^2 + regularization_epsilon)
-    where w_i is the corresponding diagonal entry in prior_FIM.
-    using label-based alignment for safety and subsets for efficiency.
-
-    Parameters
-    ----------
-    model : ConcreteModel
-        Annotated Pyomo model
-    prior_FIM : pd.DataFrame
-        Prior Fisher Information Matrix used for label-based variable selection
-    theta_ref: pd.Series, optional
-        Reference parameter values used in regularization. If None, defaults to
-        the current parameter values in the model.
-    regularization_epsilon: float, optional
-        Positive smoothing parameter in the smooth absolute value approximation.
-
-    Returns
-    -------
-    expr : Pyomo expression
-        Expression representing the smooth L1 objective addition
-    """
-    _validate_prior_FIM(prior_FIM, require_psd=True)
-
-    if regularization_epsilon <= 0:
-        raise ValueError("regularization_epsilon must be positive.")
-
-    # Get current model parameters
-    current_param_names = [p.name for p in model.unknown_parameters]
-    param_map = {p.name: p for p in model.unknown_parameters}
-
-    # Confirm all matching parameters in both prior_FIM index and columns
-    common_params = [
-        p
-        for p in current_param_names
-        if p in prior_FIM.columns and p in prior_FIM.index
-    ]
-
-    if len(common_params) == 0:
-        logger.warning(
-            "Warning: No matching parameters found between Model and Prior FIM. Returning standard objective."
-        )
-        return 0.0
-    elif len(common_params) < len(set(prior_FIM.columns).union(set(prior_FIM.index))):
-        logger.warning(
-            "Warning: Only a subset of parameters in the Prior FIM match the Model parameters. "
-            "Regularization will be applied only to the matching subset."
-        )
-    else:
-        logger.info(
-            "All parameters in the Prior FIM match the Model parameters. Regularization will be applied to all parameters."
-        )
-
-    # Slice to matching subset and use diagonal entries as nonnegative weights.
-    sub_FIM = prior_FIM.loc[common_params, common_params]
-
-    # Construct reference vector over the matching subset
-    if theta_ref is not None:
-        if not isinstance(theta_ref, pd.Series):
-            theta_ref = pd.Series(theta_ref)
-        missing_ref = [p for p in common_params if p not in theta_ref.index]
-        if missing_ref:
-            raise ValueError(
-                "theta_ref is missing values for parameter(s): "
-                + ", ".join(missing_ref)
-            )
-        sub_theta = theta_ref.loc[common_params]
-    else:
-        sub_theta = pd.Series(0, index=common_params)
-        for param in common_params:
-            sub_theta.loc[param] = pyo.value(param_map[param])
-        logger.info(
-            "theta_ref is None. Using initialized parameter values as reference."
-        )
-
-    l1_term = 0.0
-    for p in common_params:
-        weight = float(sub_FIM.loc[p, p])
-        var = param_map[p]
-        has_finite_lb = True
-        has_finite_ub = True
-        if hasattr(var, "lb") and hasattr(var, "ub"):
-            lb = pyo.value(var.lb, exception=False) if var.lb is not None else None
-            ub = pyo.value(var.ub, exception=False) if var.ub is not None else None
-            has_finite_lb = lb is not None and np.isfinite(lb)
-            has_finite_ub = ub is not None and np.isfinite(ub)
-        if weight == 0.0:
-            if not has_finite_lb and not has_finite_ub:
-                logger.warning(
-                    "L1 regularization weight is zero for parameter '%s' and the "
-                    "parameter has no finite bounds. This can create a weakly "
-                    "identified flat direction.",
-                    p,
-                )
-            continue
-        delta = var - sub_theta.loc[p]
-        l1_term += weight * pyo.sqrt(delta * delta + regularization_epsilon)
-
-    return l1_term
-
-
-def L1_regularized_objective(
-    model,
-    prior_FIM,
-    theta_ref=None,
-    regularization_weight=1.0,
-    regularization_epsilon=1e-6,
-    obj_function=SSE,
-):
-    """
-    Calculates objective + regularization_weight*sum_i w_i*sqrt((theta_i-theta_ref_i)^2 + regularization_epsilon)
-    where w_i is the corresponding diagonal entry in prior_FIM.
-    using label-based alignment for safety and subsets for efficiency.
-
-    Parameters
-    ----------
-    model : ConcreteModel
-        Annotated Pyomo model
-    prior_FIM : pd.DataFrame
-        Prior Fisher Information Matrix used for label-based variable selection
-    theta_ref: pd.Series, optional
-        Reference parameter values used in regularization. If None, defaults to
-        the current parameter values in the model.
-    regularization_weight: float, optional
-        Weighting factor for the regularization term. Default is 1.0.
-    regularization_epsilon: float, optional
-        Positive smoothing parameter in the smooth absolute value approximation.
-    obj_function: callable, optional
-        Built-in objective function selected by the user, e.g., `SSE`. Default is `SSE`.
-
-    Returns
-    -------
-    expr : Pyomo expression
-        Expression representing the smooth L1-regularized objective
-    """
-    l1_term = _calculate_L1_smooth_penalty(
-        model,
-        prior_FIM=prior_FIM,
-        theta_ref=theta_ref,
-        regularization_epsilon=regularization_epsilon,
-    )
-    object_expr = obj_function(model)
-    l1reg_objective = object_expr + (regularization_weight * l1_term)
-    return l1reg_objective
-
-
 def _check_model_labels(model):
     """
     Checks if the annotated Pyomo model contains the necessary suffixes
@@ -706,7 +556,6 @@ class ObjectiveType(Enum):
 
 class RegularizationType(Enum):
     L2 = "L2"
-    L1 = "L1"
 
 
 # Compute the Jacobian matrix of measured variables with respect to the parameters
@@ -1162,10 +1011,9 @@ class Estimator:
     solver_options: dict, optional
         Provides options to the solver (also the name of an attribute).
         Default is None.
-
         Added keyword arguments for objective regularization:
     regularization: string, optional
-        Built-in regularization type ("L2" or "L1"). If no regularization is
+        Built-in regularization type ("L2"). If no regularization is
         specified, no regularization term is added to the objective.
         Default is None.
     prior_FIM: pd.DataFrame, optional
@@ -1178,12 +1026,7 @@ class Estimator:
         If None, defaults to the current parameter values in the model.
     regularization_weight: float, optional
         Weighting factor for the regularization term. Used with
-        ``regularization="L2"`` or ``regularization="L1"``
-        and defaults to 1.0 when omitted.
-    regularization_epsilon: float, optional
-        Positive smoothing parameter used with ``regularization="L1"``
-        in ``sqrt((theta-theta_ref)^2 + regularization_epsilon)``.
-        Defaults to ``1e-6`` when omitted.
+        ``regularization="L2"``. Default is 1.0.
     """
 
     # The singledispatchmethod decorator is used here as a deprecation
@@ -1191,6 +1034,7 @@ class Estimator:
     # which had a different number of arguments. When the deprecated API
     # is removed this decorator and the _deprecated_init method below
     # can be removed
+
     @singledispatchmethod
     def __init__(
         self,
@@ -1275,10 +1119,6 @@ class Estimator:
             _validate_prior_FIM(prior_FIM, require_psd=True)
             if theta_ref is not None and not isinstance(theta_ref, pd.Series):
                 theta_ref = pd.Series(theta_ref)
-            if regularization_epsilon is not None:
-                raise ValueError(
-                    "regularization_epsilon is only supported when regularization='L1'."
-                )
 
             if regularization_weight is None:
                 regularization_weight = 1.0
@@ -1289,27 +1129,7 @@ class Estimator:
             self.theta_ref = theta_ref
             self.regularization_weight = regularization_weight
             self.regularization_epsilon = None
-        elif self.regularization == RegularizationType.L1:
-            if prior_FIM is None:
-                raise ValueError("prior_FIM must be provided when regularization='L1'.")
-            _validate_prior_FIM(prior_FIM, require_psd=True)
-            if theta_ref is not None and not isinstance(theta_ref, pd.Series):
-                theta_ref = pd.Series(theta_ref)
 
-            if regularization_weight is None:
-                regularization_weight = 1.0
-            if regularization_weight < 0:
-                raise ValueError("regularization_weight must be nonnegative.")
-
-            if regularization_epsilon is None:
-                regularization_epsilon = 1e-6
-            if regularization_epsilon <= 0:
-                raise ValueError("regularization_epsilon must be positive.")
-
-            self.prior_FIM = prior_FIM
-            self.theta_ref = theta_ref
-            self.regularization_weight = regularization_weight
-            self.regularization_epsilon = regularization_epsilon
         else:
             raise ValueError(
                 f"Unsupported regularization option: {self.regularization}. "
@@ -1521,15 +1341,6 @@ class Estimator:
                     prior_FIM=self.prior_FIM,
                     theta_ref=self.theta_ref,
                     regularization_weight=self.regularization_weight,
-                    obj_function=base_objective,
-                )
-            elif self.regularization == RegularizationType.L1:
-                second_stage_rule = lambda m: L1_regularized_objective(
-                    m,
-                    prior_FIM=self.prior_FIM,
-                    theta_ref=self.theta_ref,
-                    regularization_weight=self.regularization_weight,
-                    regularization_epsilon=self.regularization_epsilon,
                     obj_function=base_objective,
                 )
             else:
