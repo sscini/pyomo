@@ -391,21 +391,23 @@ def _count_total_experiments(experiment_list):
     for experiment in experiment_list:
         output_vars = experiment.get_labeled_model().experiment_outputs
         output_var_keys = list(output_vars.keys())
-        first_var_key = output_var_keys[0]
-        first_parent = first_var_key.parent_component()
+        assert (
+            output_var_keys
+        ), "Experiment output suffix must contain at least one key."
 
         grouped_output_vars = {}
         for output_var in output_var_keys:
-            grouped_output_vars.setdefault(output_var.parent_component(), []).append(
-                output_var
-            )
+            # Use component name as a stable, hashable key for ScalarVar/IndexedVar.
+            parent_name = output_var.parent_component().name
+            grouped_output_vars.setdefault(parent_name, []).append(output_var)
 
-        first_parent_indices = grouped_output_vars[first_parent]
+        first_parent_indices = next(iter(grouped_output_vars.values()))
         first_parent_alignment = [
             _get_alignment_index(output_var) for output_var in first_parent_indices
         ]
 
-        for parent_component, parent_indices in grouped_output_vars.items():
+        # All output families in one experiment must align on the same index points.
+        for parent_indices in grouped_output_vars.values():
             assert len(parent_indices) == len(first_parent_indices), (
                 "Experiment output families must have the same number of labeled "
                 "points within each experiment."
@@ -418,15 +420,16 @@ def _count_total_experiments(experiment_list):
                 "the single index or the first element of a tuple index."
             )
 
+        points_in_experiment = len(first_parent_indices)
         if expected_points_per_experiment is None:
-            expected_points_per_experiment = len(first_parent_indices)
+            expected_points_per_experiment = points_in_experiment
         else:
-            assert len(first_parent_indices) == expected_points_per_experiment, (
+            assert points_in_experiment == expected_points_per_experiment, (
                 "Experiments in experiment_list must contain the same number of "
                 "labeled points."
             )
 
-        total_data_points += len(first_parent_indices)
+        total_data_points += points_in_experiment
 
     return total_data_points
 
