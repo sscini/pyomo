@@ -1413,13 +1413,6 @@ class Estimator:
             each experiment in exp_list or bootlist.
         """
         model = pyo.ConcreteModel()
-        # if multistart:
-        #     template_experiment = self.exp_list[0]
-        #     if theta_vals is not None and hasattr(template_experiment, "theta_initial"):
-        #         template_experiment.theta_initial = dict(theta_vals)
-        #     if hasattr(template_experiment, "model"):
-        #         template_experiment.model = None
-
         template_model = self._create_parmest_model(0)
         expanded_theta_names, expanded_theta_cuids = self._expanded_theta_info(
             template_model
@@ -1458,15 +1451,6 @@ class Estimator:
             bootlist if bootlist is not None else list(range(len(self.exp_list)))
         )
 
-        # # Create indexed block for holding scenario models
-        # model.exp_scenarios = pyo.Block(range(self.obj_probability_constant))
-        # for i, experiment_number in enumerate(scenario_numbers):
-        #     if multistart:
-        #         experiment = self.exp_list[experiment_number]
-        #         if theta_vals is not None and hasattr(experiment, "theta_initial"):
-        #             experiment.theta_initial = dict(theta_vals)
-        #         if hasattr(experiment, "model"):
-        #             experiment.model = None
         # get the probability constant that is applied to the objective function
         # parmest solves the estimation problem by applying equal probabilities to
         # the objective function of all the scenarios from the experiment list
@@ -1657,7 +1641,6 @@ class Estimator:
                 raise TypeError("n_restarts must be an integer.")
             if n_restarts <= 0:
                 raise ValueError("n_restarts must be greater than zero.")
-            # Generate theta values using Latin hypercube sampling or Sobol sampling
             # Generate theta values using Latin hypercube sampling
             # Create a Latin Hypercube sampler that uses the dimensions of the theta names
             sampler = scipy.stats.qmc.LatinHypercube(d=len(theta_names), seed=seed)
@@ -1715,9 +1698,6 @@ class Estimator:
         df_multistart["final objective"] = np.nan
         df_multistart["solver termination"] = ""
         df_multistart["solve_time"] = np.nan
-
-        # Debugging output
-        # print(df_multistart)
 
         return df_multistart
 
@@ -2668,7 +2648,6 @@ class Estimator:
 
         return results_df, best_theta, best_obj
 
-    # Updated version that uses _Q_opt
     def _normalize_theta_dataframe(self, theta_values):
         """
         Validate and normalize user-provided theta_values columns.
