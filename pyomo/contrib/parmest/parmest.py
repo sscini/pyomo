@@ -1252,6 +1252,7 @@ class Estimator:
 
     def _expanded_theta_info(self, model):
         """
+        Version of _expanded_unknown_parameter_info within the Estimator class.
         Return scalar theta names and ComponentUIDs for all unknown parameters.
 
         The unknown_parameters suffix may contain either scalar ComponentData
@@ -1592,7 +1593,7 @@ class Estimator:
         """
         parmest_model = self._create_parmest_model(experiment_number)
 
-        raw_theta_names = self._expand_indexed_unknowns(parmest_model)
+        raw_theta_names, _ = self._expanded_theta_info(parmest_model)
         theta_names = [n.replace("'", "") for n in raw_theta_names]
         if len(theta_names) != len(set(theta_names)):
             raise ValueError(f"Duplicate theta names are not allowed: {theta_names}")
@@ -1803,16 +1804,11 @@ class Estimator:
         )
         expanded_theta_names = list(model._parmest_theta_names)
 
-        logger.debug("Parmest _Q_opt model with scenario blocks:")
-
-        if logger.isEnabledFor(logging.DEBUG):
-            model.pprint()
-
         # Check solver and set options
         if solver == "k_aug":
             raise RuntimeError("k_aug no longer supported.")
         if solver == "ef_ipopt":
-            sol = SolverFactory('ipopt')
+            sol = SolverFactory('ipopt_v2')
         else:
             raise RuntimeError("Unknown solver in Q_Opt=" + solver)
         # Currently, parmest is only tested with ipopt via ef_ipopt
@@ -1825,7 +1821,12 @@ class Estimator:
 
         # Solve model without loading solution values until the termination
         # condition has been checked.
-        solve_result = sol.solve(model, tee=self.tee, load_solutions=False)
+        solve_result = sol.solve(
+            model,
+            tee=self.tee,
+            load_solutions=False,
+            raise_exception_on_nonoptimal_result=False,
+        )
         termination_condition = solve_result.solver.termination_condition
 
         if fix_theta and (
@@ -1857,14 +1858,8 @@ class Estimator:
         self.obj_value = obj_value
         self.estimated_theta = theta_estimates
 
-        # # If fixing theta, return objective value, theta estimates, and worst status
-        # if fix_theta or multistart:
-        #     return obj_value, theta_estimates, worst_status
-
-        # # Return theta estimates as a pandas Series
-        # theta_estimates = pd.Series(theta_estimates)
         # If fixing theta, return objective value, theta estimates, and solver status
-        if fix_theta:
+        if fix_theta or multistart:
             return obj_value, theta_estimates, termination_condition
 
         # Extract return values if requested
