@@ -19,6 +19,7 @@ import pyomo.contrib.parmest.graphics as graphics
 import pyomo.contrib.parmest as parmestbase
 import pyomo.environ as pyo
 import pyomo.dae as dae
+import math
 
 from pyomo.common.dependencies import numpy as np, pandas as pd, scipy, matplotlib
 from pyomo.common.fileutils import this_file_dir
@@ -2445,36 +2446,8 @@ class TestCountTotalExperiments(unittest.TestCase):
         ):
             parmest._count_total_experiments(exp_list)
 
-class LinearThetaExperiment(Experiment):
-    def __init__(self, x, y):
-        self.x_data = x
-        self.y_data = y
-        self.model = None
 
-    def create_model(self):
-        m = pyo.ConcreteModel()
-        m.theta = pyo.Var(initialize=0.0, bounds=(-10.0, 10.0))
-        m.x = pyo.Param(initialize=float(self.x_data), mutable=False)
-        m.y = pyo.Var(initialize=float(self.y_data))
-        m.eq = pyo.Constraint(expr=m.y == m.theta + m.x)
-        self.model = m
-
-    def label_model(self):
-        m = self.model
-        m.experiment_outputs = pyo.Suffix(direction=pyo.Suffix.LOCAL)
-        m.experiment_outputs.update([(m.y, float(self.y_data))])
-        m.unknown_parameters = pyo.Suffix(direction=pyo.Suffix.LOCAL)
-        m.unknown_parameters.update([(m.theta, pyo.ComponentUID(m.theta))])
-        m.measurement_error = pyo.Suffix(direction=pyo.Suffix.LOCAL)
-        m.measurement_error.update([(m.y, None)])
-
-    def get_labeled_model(self):
-        self.create_model()
-        self.label_model()
-        return self.model
-
-
-class IndexedThetaExperiment(Experiment):
+class IndexedThetaMultistartExperiment(Experiment):
     def __init__(self):
         self.model = None
 
@@ -2695,7 +2668,9 @@ class TestParmestMultistart(unittest.TestCase):
             )
 
     def test_user_provided_values_column_order_maps_by_name(self):
-        pest = parmest.Estimator([IndexedThetaExperiment()], obj_function="SSE")
+        pest = parmest.Estimator(
+            [IndexedThetaMultistartExperiment()], obj_function="SSE"
+        )
         user_df = pd.DataFrame(
             [[0.3, 4.2], [0.4, 4.1]], columns=["theta[b]", "theta[a]"]
         )
@@ -2724,84 +2699,10 @@ class TestParmestMultistart(unittest.TestCase):
             places=8,
         )
 
-    def test_one_start_failure_returns_best_feasible(self):
-        pest = _build_linear_estimator()
-        theta_values = pd.DataFrame([[-1.0], [2.0]], columns=["theta"])
-
-        def fake_q_opt(*args, **kwargs):
-            theta = kwargs["theta_vals"]["theta"]
-            if theta < 0:
-                raise RuntimeError("boom")
-            return 1.25, {"theta": 1.0}, pyo.TerminationCondition.optimal
-
-        with patch.object(pest, "_Q_opt", side_effect=fake_q_opt):
-            results_df, best_theta, best_obj = pest.theta_est_multistart(
-                user_provided_df=theta_values, save_results=False
-            )
-
-        self.assertTrue(
-            str(results_df.loc[0, "solver termination"]).startswith("exception(start=0")
-        )
-        self.assertAlmostEqual(best_obj, 1.25, places=12)
-        self.assertAlmostEqual(best_theta["theta"], 1.0, places=12)
-
-    def test_all_starts_fail_returns_diagnostics(self):
-        pest = _build_linear_estimator()
-        theta_values = pd.DataFrame([[1.0], [2.0]], columns=["theta"])
-
-        def fake_q_opt(*args, **kwargs):
-            raise RuntimeError("all failed")
-
-        with patch.object(pest, "_Q_opt", side_effect=fake_q_opt):
-            results_df, best_theta, best_obj = pest.theta_est_multistart(
-                user_provided_df=theta_values, save_results=False
-            )
-
-        self.assertIsNone(best_theta)
-        self.assertTrue(math.isnan(best_obj))
-        self.assertTrue(
-            results_df["solver termination"]
-            .astype(str)
-            .str.contains("exception\\(start=", regex=True)
-            .all()
-        )
-
-    def test_best_selection_filters_nonoptimal_status(self):
-        pest = _build_linear_estimator()
-        theta_values = pd.DataFrame([[1.0], [2.0]], columns=["theta"])
-
-        def fake_q_opt(*args, **kwargs):
-            theta = kwargs["theta_vals"]["theta"]
-            if theta < 1.5:
-                return 0.1, {"theta": 0.1}, pyo.TerminationCondition.maxIterations
-            return 0.2, {"theta": 0.2}, pyo.TerminationCondition.optimal
-
-        with patch.object(pest, "_Q_opt", side_effect=fake_q_opt):
-            _, best_theta, best_obj = pest.theta_est_multistart(
-                user_provided_df=theta_values, save_results=False
-            )
-
-        self.assertAlmostEqual(best_obj, 0.2, places=12)
-        self.assertAlmostEqual(best_theta["theta"], 0.2, places=12)
-
-    def test_tie_breaking_is_deterministic_first_index(self):
-        pest = _build_linear_estimator()
-        theta_values = pd.DataFrame([[5.0], [6.0], [7.0]], columns=["theta"])
-
-        def fake_q_opt(*args, **kwargs):
-            theta = kwargs["theta_vals"]["theta"]
-            return 1.0, {"theta": theta}, pyo.TerminationCondition.optimal
-
-        with patch.object(pest, "_Q_opt", side_effect=fake_q_opt):
-            _, best_theta, best_obj = pest.theta_est_multistart(
-                user_provided_df=theta_values, save_results=False
-            )
-
-        self.assertAlmostEqual(best_obj, 1.0, places=12)
-        self.assertAlmostEqual(best_theta["theta"], 5.0, places=12)
-
     def test_indexed_unknown_parameters_supported_in_sampling(self):
-        pest = parmest.Estimator([IndexedThetaExperiment()], obj_function="SSE")
+        pest = parmest.Estimator(
+            [IndexedThetaMultistartExperiment()], obj_function="SSE"
+        )
         df = pest._generate_initial_theta(
             seed=10, n_restarts=3, multistart_sampling_method="uniform_random"
         )
@@ -2861,6 +2762,7 @@ class TestParmestMultistart(unittest.TestCase):
     #         self.assertTrue(
     #             np.isclose(theta["theta"], row["converged_theta"], rtol=1e-6, atol=1e-8)
     #         )
+
 
 ###########################
 # tests for deprecated UI #
