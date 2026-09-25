@@ -1431,6 +1431,14 @@ class Estimator:
         # they serve as user-facing labels and result keys.
         model.parmest_theta = pyo.Var(model._parmest_theta_names)
 
+        fixed_theta_values = fixed_theta_values or {}
+        invalid_fixed_theta = set(fixed_theta_values).difference(expanded_theta_names)
+        if invalid_fixed_theta:
+            raise ValueError(
+                f"Unknown theta name(s) in fixed_theta_values: {sorted(invalid_fixed_theta)}"
+            )
+        fixed_theta_names = set(fixed_theta_values.keys())
+
         # Initialize parent/global theta values from the template model.
         for name, cuid in zip(expanded_theta_names, expanded_theta_cuids):
             template_theta_var = cuid.find_component_on(template_model)
@@ -1831,6 +1839,8 @@ class Estimator:
             }
             obj_value = None
             return obj_value, theta_estimates, termination_condition
+
+        partial_fix_mode = bool(fixed_theta_values)
 
         # Separate handling of termination conditions for _Q_at_theta vs _Q_opt
         # If not fixing theta, ensure optimal termination of the solve to return result
@@ -2753,7 +2763,7 @@ class Estimator:
         if seed is not None and not isinstance(seed, int):
             raise TypeError("seed must be an integer or None.")
 
-        theta_names = self._expand_indexed_unknowns(self._create_parmest_model(0))
+        theta_names, _ = self._expanded_theta_info(self._create_parmest_model(0))
         unknown_requested = set(profiled_theta_list).difference(theta_names)
         if unknown_requested:
             raise ValueError(
