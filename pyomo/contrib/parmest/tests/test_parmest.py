@@ -2859,13 +2859,13 @@ class TestParmestProfileLikelihood(unittest.TestCase):
         )
 
     @unittest.skipIf(not ipopt_available, "The 'ipopt' solver is not available")
-    def test_profile_repeatability_same_seed(self):
+    def test_profile_repeatability(self):
         pest = _build_two_theta_estimator()
         res1 = pest.profile_likelihood(
-            "theta_a", grid=[1.5, 2.0, 2.5], solver="ef_ipopt", seed=9
+            "theta_a", grid=[1.5, 2.0, 2.5], solver="ef_ipopt"
         )
         res2 = pest.profile_likelihood(
-            "theta_a", grid=[1.5, 2.0, 2.5], solver="ef_ipopt", seed=9
+            "theta_a", grid=[1.5, 2.0, 2.5], solver="ef_ipopt"
         )
         cols = [
             "theta_value",

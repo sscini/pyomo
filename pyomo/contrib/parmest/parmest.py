@@ -2729,7 +2729,6 @@ class Estimator:
         warmstart="neighbor",
         max_consecutive_failures=None,
         return_theta_paths=True,
-        seed=None,
     ):
         """
         Compute one-dimensional profile likelihood curves by fixing one parameter
@@ -2760,8 +2759,6 @@ class Estimator:
                 raise ValueError("max_consecutive_failures must be greater than zero.")
         if not isinstance(return_theta_paths, bool):
             raise TypeError("return_theta_paths must be a bool.")
-        if seed is not None and not isinstance(seed, int):
-            raise TypeError("seed must be an integer or None.")
 
         theta_names, _ = self._expanded_theta_info(self._create_parmest_model(0))
         unknown_requested = set(profiled_theta_list).difference(theta_names)
@@ -2770,9 +2767,6 @@ class Estimator:
                 f"Unknown profile theta name(s): {sorted(unknown_requested)}. "
                 f"Known names: {theta_names}."
             )
-
-        if seed is not None:
-            np.random.seed(seed)
 
         if theta_hat is None or obj_hat is None:
             if use_multistart_for_baseline:
@@ -2898,7 +2892,6 @@ class Estimator:
             "metadata": {
                 "grid_strategy": "user_provided" if grid is not None else "auto_bounds",
                 "warmstart": warmstart,
-                "seed": seed,
                 "profiled_theta": list(profiled_theta_list),
                 "started_at_epoch": float(started_at),
                 "finished_at_epoch": float(time.time()),
