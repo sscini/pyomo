@@ -8,10 +8,12 @@
 #  This software is distributed under the 3-clause BSD License.
 #  ___________________________________________________________________________
 
+import logging
+
 import pyomo.common.unittest as unittest
 import pyomo.environ as pyo
+from pyomo.common.log import LoggingIntercept
 from pyomo.common.dependencies import numpy as np, pandas as pd
-from unittest.mock import patch
 
 import pyomo.contrib.parmest.parmest as parmest
 from pyomo.contrib.parmest.experiment import Experiment
@@ -54,13 +56,28 @@ class AffineTwoThetaExperiment(Experiment):
         return self.model
 
 
-def _build_two_theta_estimator():
+class _InitRecordingEstimator(parmest.Estimator):
+    """Estimator that records the initial theta values of each profile solve."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.profile_theta_inits = []
+
+    def _Q_opt(self, *args, **kwargs):
+        if kwargs.get("fixed_theta_values"):
+            self.profile_theta_inits.append(dict(kwargs["theta_vals"]))
+        return super()._Q_opt(*args, **kwargs)
+
+
+def _build_two_theta_estimator(estimator_class=parmest.Estimator):
+    # Data lie exactly on y = 2x + 1, so theta_hat = (2, 1) and, with
+    # theta_a fixed at a, the profiled optimum is theta_b = 5 - 2a.
     exp_list = [
         AffineTwoThetaExperiment(1.0, 3.0),
         AffineTwoThetaExperiment(2.0, 5.0),
         AffineTwoThetaExperiment(3.0, 7.0),
     ]
-    return parmest.Estimator(exp_list, obj_function="SSE")
+    return estimator_class(exp_list, obj_function="SSE")
 
 
 @unittest.skipIf(
@@ -116,94 +133,82 @@ class TestParmestProfileLikelihood(unittest.TestCase):
         ]
         self.assertTrue(res1["profiles"][cols].equals(res2["profiles"][cols]))
 
+    @unittest.skipIf(not ipopt_available, "The 'ipopt' solver is not available")
     def test_profile_warmstart_neighbor_values_used(self):
-        pest = _build_two_theta_estimator()
-        call_inits = []
+        # theta_hat["theta_b"] is deliberately off (0.0 instead of 1.0) so that
+        # warm-started initial values are distinguishable from theta_hat.
+        theta_hat = {"theta_a": 2.0, "theta_b": 0.0}
+        grid = [2.0, 2.1, 2.2]
 
-        def fake_q_opt(*args, **kwargs):
-            init = dict(kwargs["theta_vals"])
-            fixed = kwargs["fixed_theta_values"]
-            call_inits.append(init)
-            return (
-                float((fixed["theta_a"] - 2.0) ** 2),
-                {"theta_a": fixed["theta_a"], "theta_b": fixed["theta_a"] + 10.0},
-                pyo.TerminationCondition.optimal,
-            )
+        pest = _build_two_theta_estimator(_InitRecordingEstimator)
+        pest.profile_likelihood(
+            "theta_a", grid=grid, theta_hat=theta_hat, obj_hat=0.0, warmstart="neighbor"
+        )
+        inits = pest.profile_theta_inits
+        self.assertEqual([init["theta_a"] for init in inits], grid)
+        # First solve starts from theta_hat; each later solve starts from the
+        # previous converged point (theta_b = 5 - 2 * theta_a).
+        self.assertEqual(inits[0]["theta_b"], 0.0)
+        self.assertAlmostEqual(inits[1]["theta_b"], 1.0, places=6)
+        self.assertAlmostEqual(inits[2]["theta_b"], 0.8, places=6)
 
-        with patch.object(pest, "_Q_opt", side_effect=fake_q_opt):
-            pest.profile_likelihood(
-                "theta_a",
-                grid=[2.0, 2.1, 2.2],
-                theta_hat={"theta_a": 2.0, "theta_b": 1.0},
-                obj_hat=0.0,
-                warmstart="neighbor",
-            )
+        pest = _build_two_theta_estimator(_InitRecordingEstimator)
+        pest.profile_likelihood(
+            "theta_a", grid=grid, theta_hat=theta_hat, obj_hat=0.0, warmstart="none"
+        )
+        self.assertEqual(
+            [init["theta_b"] for init in pest.profile_theta_inits], [0.0, 0.0, 0.0]
+        )
 
-        self.assertGreaterEqual(len(call_inits), 2)
-        self.assertAlmostEqual(call_inits[1]["theta_b"], 12.0, places=12)
-
+    @unittest.skipIf(not ipopt_available, "The 'ipopt' solver is not available")
     def test_profile_failure_recorded_continue(self):
         pest = _build_two_theta_estimator()
-
-        def fake_q_opt(*args, **kwargs):
-            a = kwargs["fixed_theta_values"]["theta_a"]
-            if abs(a - 2.0) < 1e-12:
-                raise RuntimeError("boom")
-            return (
-                1.0 + abs(a),
-                {"theta_a": a, "theta_b": 0.0},
-                pyo.TerminationCondition.optimal,
-            )
-
-        with patch.object(pest, "_Q_opt", side_effect=fake_q_opt):
+        # theta_a = 5.0 is outside the model bounds (0, 4), so that solve
+        # fails while the neighboring grid points still succeed.
+        with LoggingIntercept(level=logging.WARNING) as LOG:
             res = pest.profile_likelihood(
                 "theta_a",
-                grid=[1.9, 2.0, 2.1],
-                theta_hat={"theta_a": 2.0, "theta_b": 0.0},
-                obj_hat=1.0,
+                grid=[1.9, 5.0, 2.1],
+                theta_hat={"theta_a": 2.0, "theta_b": 1.0},
+                obj_hat=0.0,
             )
+        self.assertIn("outside the bounds", LOG.getvalue())
 
-        prof = res["profiles"].sort_values("theta_value").reset_index(drop=True)
-        self.assertEqual(len(prof), 3)
-        self.assertIn("exception", str(prof.loc[1, "status"]))
-        self.assertFalse(bool(prof.loc[1, "success"]))
+        prof = res["profiles"].set_index("theta_value")
+        self.assertEqual(len(prof), 4)
+        self.assertIn("exception", str(prof.loc[5.0, "status"]))
+        self.assertFalse(bool(prof.loc[5.0, "success"]))
+        self.assertTrue(np.isnan(prof.loc[5.0, "obj"]))
+        self.assertTrue(prof.drop(index=5.0)["success"].all())
 
     def test_profile_all_failures_returns_structure(self):
         pest = _build_two_theta_estimator()
-
-        with patch.object(pest, "_Q_opt", side_effect=RuntimeError("all failed")):
-            res = pest.profile_likelihood(
-                "theta_a",
-                grid=[1.9, 2.0, 2.1],
-                theta_hat={"theta_a": 2.0, "theta_b": 0.0},
-                obj_hat=1.0,
-            )
+        # An unknown solver makes every profile solve raise.
+        res = pest.profile_likelihood(
+            "theta_a",
+            grid=[1.9, 2.0, 2.1],
+            theta_hat={"theta_a": 2.0, "theta_b": 0.0},
+            obj_hat=1.0,
+            solver="not_a_solver",
+        )
 
         prof = res["profiles"]
         self.assertEqual(len(prof), 3)
         self.assertFalse(prof["success"].any())
         self.assertTrue(prof["status"].astype(str).str.contains("exception").all())
+        self.assertTrue(prof["obj"].isna().all())
 
+    @unittest.skipIf(not ipopt_available, "The 'ipopt' solver is not available")
     def test_profile_user_grid_preserved(self):
         pest = _build_two_theta_estimator()
+        res = pest.profile_likelihood(
+            "theta_a",
+            grid=[1.2, 2.4, 2.0],
+            theta_hat={"theta_a": 2.0, "theta_b": 1.0},
+            obj_hat=0.0,
+        )
 
-        with patch.object(
-            pest,
-            "_Q_opt",
-            side_effect=lambda *args, **kwargs: (
-                1.0,
-                {"theta_a": kwargs["fixed_theta_values"]["theta_a"], "theta_b": 0.0},
-                pyo.TerminationCondition.optimal,
-            ),
-        ):
-            res = pest.profile_likelihood(
-                "theta_a",
-                grid=[1.2, 2.4, 2.0],
-                theta_hat={"theta_a": 2.0, "theta_b": 0.0},
-                obj_hat=1.0,
-            )
-
-        attempted = sorted(res["profiles"]["theta_value"].tolist())
+        attempted = res["profiles"]["theta_value"].tolist()
         self.assertEqual(attempted, [1.2, 2.0, 2.4])
 
     def test_profile_auto_grid_includes_theta_hat(self):
@@ -216,24 +221,15 @@ class TestParmestProfileLikelihood(unittest.TestCase):
         )
         self.assertIn(2.0, set(np.round(grid, 12)))
 
+    @unittest.skipIf(not ipopt_available, "The 'ipopt' solver is not available")
     def test_profile_result_columns_schema(self):
         pest = _build_two_theta_estimator()
-
-        with patch.object(
-            pest,
-            "_Q_opt",
-            side_effect=lambda *args, **kwargs: (
-                1.0,
-                {"theta_a": kwargs["fixed_theta_values"]["theta_a"], "theta_b": 0.0},
-                pyo.TerminationCondition.optimal,
-            ),
-        ):
-            res = pest.profile_likelihood(
-                "theta_a",
-                grid=[1.9, 2.0],
-                theta_hat={"theta_a": 2.0, "theta_b": 0.0},
-                obj_hat=1.0,
-            )
+        res = pest.profile_likelihood(
+            "theta_a",
+            grid=[1.9, 2.0],
+            theta_hat={"theta_a": 2.0, "theta_b": 1.0},
+            obj_hat=0.0,
+        )
         prof = res["profiles"]
         self.assertTrue(
             set(
@@ -246,6 +242,8 @@ class TestParmestProfileLikelihood(unittest.TestCase):
                     "status",
                     "success",
                     "solve_time",
+                    "theta__theta_a",
+                    "theta__theta_b",
                 ]
             ).issubset(prof.columns)
         )

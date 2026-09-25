@@ -1861,7 +1861,7 @@ class Estimator:
         self.estimated_theta = theta_estimates
 
         # If fixing theta, return objective value, theta estimates, and solver status
-        if fix_theta or multistart:
+        if fix_theta or multistart or partial_fix_mode:
             return obj_value, theta_estimates, termination_condition
 
         # Extract return values if requested
@@ -2785,8 +2785,8 @@ class Estimator:
                 theta_hat = best_theta
                 obj_hat = best_obj
             else:
-                obj_hat, theta_hat_series = self.theta_est(solver=solver)
-                theta_hat = theta_hat_series.to_dict()
+                obj_hat, theta_hat = self.theta_est(solver=solver)
+                theta_hat = dict(theta_hat)
 
         theta_hat = {k: float(v) for k, v in theta_hat.items()}
         obj_hat = float(obj_hat)
