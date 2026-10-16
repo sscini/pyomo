@@ -132,6 +132,7 @@ the following methods:
    ~pyomo.contrib.parmest.parmest.Estimator.theta_est_bootstrap
    ~pyomo.contrib.parmest.parmest.Estimator.theta_est_leaveNout
    ~pyomo.contrib.parmest.parmest.Estimator.objective_at_theta
+   ~pyomo.contrib.parmest.parmest.Estimator.experiment_results_at_theta
    ~pyomo.contrib.parmest.parmest.Estimator.confidence_region_test
    ~pyomo.contrib.parmest.parmest.Estimator.likelihood_ratio_test
    ~pyomo.contrib.parmest.parmest.Estimator.leaveNout_bootstrap_test

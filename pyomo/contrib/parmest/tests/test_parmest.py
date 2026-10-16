@@ -2350,8 +2350,18 @@ class TestParmestBlockEF(unittest.TestCase):
 
         theta_values = pd.DataFrame([[0.0], [2.0]], columns=["theta"])
 
-        obj_at_theta = pest.objective_at_theta(theta_values=theta_values)
+        with self.assertLogs(parmest.logger.name, level="WARNING") as logs:
+            obj_at_theta = pest.objective_at_theta(theta_values=theta_values)
 
+        self.assertEqual(
+            logs.output,
+            [
+                f"WARNING:{parmest.logger.name}:1 of 2 theta values did not "
+                "solve to optimality for every experiment, so their obj is NaN. "
+                "Use experiment_results_at_theta for the solver termination of "
+                "each experiment."
+            ],
+        )
         self.assertEqual(list(obj_at_theta.columns), ["theta", "obj"])
         self.assertEqual(list(obj_at_theta["theta"]), [0.0, 2.0])
         self.assertAlmostEqual(obj_at_theta.loc[0, "obj"], 1.0, places=8)
@@ -2440,6 +2450,22 @@ class TestParmestBlockEF(unittest.TestCase):
         )
 
         pd.testing.assert_frame_equal(combined, separate)
+
+    @unittest.skipIf(not ipopt_available, "The 'ipopt' solver is not available")
+    def test_objective_at_theta_keeps_estimation_state(self):
+        pest = _build_estimator([(1.0, 2.0), (2.0, 4.0)])
+        theta_values = pd.DataFrame([[3.0]], columns=["theta"])
+
+        pest.objective_at_theta(theta_values=theta_values)
+        self.assertFalse(hasattr(pest, "ef_instance"))
+
+        obj, theta = pest.theta_est()
+        ef_instance = pest.ef_instance
+        pest.objective_at_theta(theta_values=theta_values)
+
+        self.assertIs(pest.ef_instance, ef_instance)
+        self.assertEqual(pest.estimated_theta, theta)
+        self.assertEqual(pest.obj_value, obj)
 
     def test_invalid_solver_name_raises_runtimeerror(self):
         pest = _build_estimator([(1.0, 2.0), (2.0, 4.0)])

@@ -1482,6 +1482,31 @@ class Estimator:
         self.ef_instance = model
         return model
 
+    # Estimator attributes that each _Q_opt call overwrites with its solution
+    _ESTIMATION_STATE_ATTRS = ("ef_instance", "estimated_theta", "obj_value")
+
+    def _save_estimation_state(self):
+        """
+        Return the solved model, estimated theta and objective value that are
+        set, for use with _restore_estimation_state.
+        """
+        state = {}
+        for attr in self._ESTIMATION_STATE_ATTRS:
+            if hasattr(self, attr):
+                state[attr] = getattr(self, attr)
+        return state
+
+    def _restore_estimation_state(self, state):
+        """
+        Restore the state returned by _save_estimation_state, removing
+        attributes that were not set when it was saved.
+        """
+        for attr in self._ESTIMATION_STATE_ATTRS:
+            if attr in state:
+                setattr(self, attr, state[attr])
+            elif hasattr(self, attr):
+                delattr(self, attr)
+
     def _Q_opt(
         self,
         return_values=None,
@@ -2418,14 +2443,20 @@ class Estimator:
         task_mgr = utils.ParallelTaskManager(len(all_thetas))
         local_tasks = task_mgr.global_to_local_data(list(enumerate(all_thetas)))
 
+        # The combined solves overwrite the estimation model used by cov_est
+        prior_state = self._save_estimation_state()
+
         # One list of experiment rows per theta, as the task manager expects
         local_results = []
-        for theta_index, theta in local_tasks:
-            theta_row = [theta[name] for name in theta_names]
-            experiment_rows = []
-            for row in self._experiment_rows_at_theta(theta, separate_experiments):
-                experiment_rows.append([theta_index] + theta_row + row)
-            local_results.append(experiment_rows)
+        try:
+            for theta_index, theta in local_tasks:
+                theta_row = [theta[name] for name in theta_names]
+                experiment_rows = []
+                for row in self._experiment_rows_at_theta(theta, separate_experiments):
+                    experiment_rows.append([theta_index] + theta_row + row)
+                local_results.append(experiment_rows)
+        finally:
+            self._restore_estimation_state(prior_state)
 
         global_results = task_mgr.allgather_global_data(local_results)
         all_experiment_rows = []
@@ -2495,6 +2526,15 @@ class Estimator:
         obj_at_theta = theta_table.groupby("theta_index").first()
         # skipna=False keeps obj NaN if any experiment is not optimal
         obj_at_theta["obj"] = obj_table.mean(axis=1, skipna=False)
+
+        num_failed = int(obj_at_theta["obj"].isna().sum())
+        if num_failed > 0:
+            logger.warning(
+                f"{num_failed} of {len(obj_at_theta)} theta values did not solve "
+                "to optimality for every experiment, so their obj is NaN. Use "
+                "experiment_results_at_theta for the solver termination of each "
+                "experiment."
+            )
         return obj_at_theta.reset_index(drop=True)
 
     def likelihood_ratio_test(
