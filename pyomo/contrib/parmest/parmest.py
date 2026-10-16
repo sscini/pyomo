@@ -61,7 +61,10 @@ import pyomo.environ as pyo
 
 from pyomo.opt import SolverFactory
 from pyomo.environ import Block, ComponentUID
-from pyomo.opt.results.solver import assert_optimal_termination
+from pyomo.opt.results.solver import (
+    assert_optimal_termination,
+    check_optimal_termination,
+)
 from pyomo.common.flags import NOTSET
 
 from pyomo.contrib.sensitivity_toolbox.sens import get_dsdp
@@ -2317,10 +2320,152 @@ class Estimator:
         # Put columns in model order.
         return theta_values[expected_theta_names]
 
-    def objective_at_theta(self, theta_values=None, initialize_parmest_model=False):
+    def _solve_fixed_theta_model(self, model):
         """
-        Objective value for each theta, solving extensive form problem with
-        fixed theta values.
+        Solve a model with fixed theta, loading the solution only if optimal.
+
+        Returns
+        -------
+        optimal : bool
+            True if the solve is optimal.
+        termination_condition : pyomo.opt.TerminationCondition
+            Solver termination condition.
+        """
+        sol = SolverFactory('ipopt')
+        if self.solver_options is not None:
+            for key in self.solver_options:
+                sol.options[key] = self.solver_options[key]
+
+        solve_result = sol.solve(model, tee=self.tee, load_solutions=False)
+        optimal = check_optimal_termination(solve_result)
+        if optimal:
+            model.solutions.load_from(solve_result)
+        return optimal, solve_result.solver.termination_condition
+
+    def _experiment_rows_at_theta(self, theta, separate_experiments):
+        """
+        Return [experiment, obj, solver_termination] for each experiment with
+        theta fixed. obj is NaN if the solve is not optimal.
+        """
+        experiment_rows = []
+
+        if separate_experiments:
+            for experiment_number in range(len(self.exp_list)):
+                model = self._create_parmest_model(experiment_number)
+                theta_names, theta_cuids = self._expanded_theta_info(model)
+                for name, cuid in zip(theta_names, theta_cuids):
+                    cuid.find_component_on(model).fix(theta[name])
+
+                optimal, termination = self._solve_fixed_theta_model(model)
+                if optimal:
+                    obj = pyo.value(model.Total_Cost_Objective)
+                else:
+                    obj = np.nan
+                experiment_rows.append([experiment_number, obj, str(termination)])
+            return experiment_rows
+
+        # With theta fixed the scenario blocks are decoupled, so an optimal
+        # combined solve means every experiment is optimal
+        model = self._create_scenario_blocks(theta_vals=theta, fix_theta=True)
+        optimal, termination = self._solve_fixed_theta_model(model)
+        for i in model.scenario_indices:
+            if optimal:
+                obj = pyo.value(model.exp_scenarios[i].Total_Cost_Objective)
+            else:
+                obj = np.nan
+            experiment_number = pyo.value(model.scenario_number[i])
+            experiment_rows.append([experiment_number, obj, str(termination)])
+        return experiment_rows
+
+    def experiment_results_at_theta(
+        self, theta_values=None, separate_experiments=False
+    ):
+        """
+        Objective value and solver termination of each experiment, solved with
+        theta fixed at each row of theta_values.
+
+        Parameters
+        ----------
+        theta_values: pd.DataFrame, columns=theta_names, optional
+            Theta values to evaluate. If None, the initial theta values from
+            the experiment models are used.
+        separate_experiments: bool, optional
+            If True, solve each experiment separately to get its own solver
+            termination. If False, solve all experiments together, which is
+            faster but reports the same termination for every experiment.
+            Default is False.
+
+        Returns
+        -------
+        experiment_results: pd.DataFrame
+            One row per theta and experiment with columns ``theta_index``,
+            theta_names, ``experiment``, ``obj`` and ``solver_termination``.
+            ``obj`` is NaN if the solve is not optimal.
+        """
+        template_model = self._create_parmest_model(0)
+        theta_names, theta_cuids = self._expanded_theta_info(template_model)
+        theta_names = list(theta_names)
+
+        if theta_values is None:
+            initial_theta = {}
+            for name, cuid in zip(theta_names, theta_cuids):
+                initial_theta[name] = pyo.value(cuid.find_component_on(template_model))
+            all_thetas = [initial_theta]
+        else:
+            theta_values = self._normalize_theta_dataframe(theta_values)
+            all_thetas = theta_values.to_dict("records")
+
+        task_mgr = utils.ParallelTaskManager(len(all_thetas))
+        local_tasks = task_mgr.global_to_local_data(list(enumerate(all_thetas)))
+
+        # One list of experiment rows per theta, as the task manager expects
+        local_results = []
+        for theta_index, theta in local_tasks:
+            theta_row = [theta[name] for name in theta_names]
+            experiment_rows = []
+            for row in self._experiment_rows_at_theta(theta, separate_experiments):
+                experiment_rows.append([theta_index] + theta_row + row)
+            local_results.append(experiment_rows)
+
+        global_results = task_mgr.allgather_global_data(local_results)
+        all_experiment_rows = []
+        for experiment_rows in global_results:
+            all_experiment_rows.extend(experiment_rows)
+
+        experiment_results = pd.DataFrame(
+            data=all_experiment_rows,
+            columns=["theta_index"]
+            + theta_names
+            + ["experiment", "obj", "solver_termination"],
+        )
+        return experiment_results
+
+    def objective_at_theta(
+        self,
+        theta_values=None,
+        initialize_parmest_model=False,
+        separate_experiments=False,
+    ):
+        """
+        Objective value for each theta, solved with fixed theta values.
+
+        Parameters
+        ----------
+        theta_values: pd.DataFrame, columns=theta_names, optional
+            Theta values to evaluate. If None, the initial theta values from
+            the experiment models are used.
+        initialize_parmest_model: bool, optional
+            Deprecated. Default is False.
+        separate_experiments: bool, optional
+            If True, solve each experiment separately instead of all
+            experiments together. Default is False.
+
+        Returns
+        -------
+        obj_at_theta: pd.DataFrame
+            One row per theta with columns theta_names and ``obj``. ``obj`` is
+            NaN unless every experiment solves to optimality, see
+            experiment_results_at_theta for the status of each experiment.
         """
 
         if self.pest_deprecated is not None:
@@ -2337,48 +2482,20 @@ class Estimator:
                 version="6.10.1",
             )
 
-        if theta_values is None:
-            template_model = self._create_parmest_model(0)
-            theta_names, _ = self._expanded_theta_info(template_model)
-            theta_names = list(theta_names)
-            all_thetas = []
-        else:
-            theta_values = self._normalize_theta_dataframe(theta_values)
-            theta_names = list(theta_values.columns)
-            all_thetas = theta_values.to_dict("records")
+        experiment_results = self.experiment_results_at_theta(
+            theta_values, separate_experiments=separate_experiments
+        )
 
-        num_tasks = len(all_thetas) if all_thetas else 1
-        task_mgr = utils.ParallelTaskManager(num_tasks)
-
-        local_thetas = task_mgr.global_to_local_data(all_thetas) if all_thetas else []
-
-        all_obj = list()
-
-        if len(all_thetas) > 0:
-            for Theta in local_thetas:
-                obj, thetvals, worststatus = self._Q_opt(
-                    theta_vals=Theta, fix_theta=True
-                )
-
-                if worststatus == pyo.TerminationCondition.infeasible or obj is None:
-                    all_obj.append(None)
-                else:
-                    all_obj.append([Theta[name] for name in theta_names] + [obj])
-
-        else:
-            obj, thetvals, worststatus = self._Q_opt(theta_vals=None, fix_theta=True)
-
-            if worststatus == pyo.TerminationCondition.infeasible or obj is None:
-                all_obj.append(None)
-            else:
-                all_obj.append([thetvals[name] for name in theta_names] + [obj])
-
-        global_all_obj = task_mgr.allgather_global_data(all_obj)
-        global_all_obj = [row for row in global_all_obj if row is not None]
-
-        dfcols = list(theta_names) + ['obj']
-        obj_at_theta = pd.DataFrame(data=global_all_obj, columns=dfcols)
-        return obj_at_theta
+        obj_table = experiment_results.pivot(
+            index="theta_index", columns="experiment", values="obj"
+        )
+        theta_table = experiment_results.drop(
+            columns=["experiment", "obj", "solver_termination"]
+        )
+        obj_at_theta = theta_table.groupby("theta_index").first()
+        # skipna=False keeps obj NaN if any experiment is not optimal
+        obj_at_theta["obj"] = obj_table.mean(axis=1, skipna=False)
+        return obj_at_theta.reset_index(drop=True)
 
     def likelihood_ratio_test(
         self, obj_at_theta, obj_value, alphas, return_thresholds=False

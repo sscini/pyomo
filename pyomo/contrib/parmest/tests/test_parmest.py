@@ -2345,17 +2345,101 @@ class TestParmestBlockEF(unittest.TestCase):
         self.assertAlmostEqual(obj_at_theta.loc[0, "theta"], 0.0, places=8)
 
     @unittest.skipIf(not ipopt_available, "The 'ipopt' solver is not available")
-    def test_objective_at_theta_omits_infeasible_rows(self):
+    def test_objective_at_theta_keeps_infeasible_rows(self):
         pest = _build_bounded_estimator([(1.0, 2.0), (2.0, 3.0)])
 
         theta_values = pd.DataFrame([[0.0], [2.0]], columns=["theta"])
 
         obj_at_theta = pest.objective_at_theta(theta_values=theta_values)
 
-        self.assertEqual(len(obj_at_theta), 1)
         self.assertEqual(list(obj_at_theta.columns), ["theta", "obj"])
-        self.assertAlmostEqual(obj_at_theta.loc[0, "theta"], 0.0, places=8)
+        self.assertEqual(list(obj_at_theta["theta"]), [0.0, 2.0])
         self.assertAlmostEqual(obj_at_theta.loc[0, "obj"], 1.0, places=8)
+        self.assertTrue(np.isnan(obj_at_theta.loc[1, "obj"]))
+
+    @unittest.skipIf(not ipopt_available, "The 'ipopt' solver is not available")
+    def test_objective_at_theta_rejects_non_optimal_solve(self):
+        pest = _build_estimator([(1.0, 2.0), (2.0, 4.0)])
+        pest.solver_options = {"max_iter": 0}
+
+        theta_values = pd.DataFrame([[3.0]], columns=["theta"])
+        obj_at_theta = pest.objective_at_theta(theta_values=theta_values)
+        experiment_results = pest.experiment_results_at_theta(theta_values)
+
+        self.assertTrue(np.isnan(obj_at_theta.loc[0, "obj"]))
+        self.assertEqual(
+            list(experiment_results["solver_termination"]),
+            ["maxIterations", "maxIterations"],
+        )
+
+    @unittest.skipIf(not ipopt_available, "The 'ipopt' solver is not available")
+    def test_objective_at_theta_partial_failure_and_duplicate_rows(self):
+        pest = _build_bounded_estimator([(1.0, 2.0), (2.0, 3.0)])
+
+        # theta=0.5 is feasible for experiment 0 (y=1.5) but not 1 (y=2.5)
+        theta_values = pd.DataFrame([[0.5], [0.0], [0.0]], columns=["theta"])
+        obj_at_theta = pest.objective_at_theta(theta_values=theta_values)
+
+        self.assertEqual(list(obj_at_theta.columns), ["theta", "obj"])
+        self.assertEqual(list(obj_at_theta["theta"]), [0.5, 0.0, 0.0])
+        self.assertTrue(np.isnan(obj_at_theta.loc[0, "obj"]))
+        self.assertAlmostEqual(obj_at_theta.loc[1, "obj"], 1.0, places=8)
+        self.assertAlmostEqual(obj_at_theta.loc[2, "obj"], 1.0, places=8)
+
+    @unittest.skipIf(not ipopt_available, "The 'ipopt' solver is not available")
+    def test_experiment_results_at_theta_combined(self):
+        pest = _build_bounded_estimator([(1.0, 2.0), (2.0, 3.0)])
+
+        # theta=0.5 is feasible for experiment 0 (y=1.5) but not 1 (y=2.5)
+        theta_values = pd.DataFrame([[0.0], [0.5]], columns=["theta"])
+        experiment_results = pest.experiment_results_at_theta(theta_values)
+
+        self.assertEqual(
+            list(experiment_results.columns),
+            ["theta_index", "theta", "experiment", "obj", "solver_termination"],
+        )
+        self.assertEqual(list(experiment_results["theta_index"]), [0, 0, 1, 1])
+        self.assertEqual(list(experiment_results["theta"]), [0.0, 0.0, 0.5, 0.5])
+        self.assertEqual(list(experiment_results["experiment"]), [0, 1, 0, 1])
+        self.assertAlmostEqual(experiment_results.loc[0, "obj"], 1.0, places=8)
+        self.assertAlmostEqual(experiment_results.loc[1, "obj"], 1.0, places=8)
+        self.assertTrue(np.isnan(experiment_results.loc[2, "obj"]))
+        self.assertTrue(np.isnan(experiment_results.loc[3, "obj"]))
+        self.assertEqual(
+            list(experiment_results["solver_termination"]),
+            ["optimal", "optimal", "infeasible", "infeasible"],
+        )
+
+    @unittest.skipIf(not ipopt_available, "The 'ipopt' solver is not available")
+    def test_experiment_results_at_theta_separate(self):
+        pest = _build_bounded_estimator([(1.0, 2.0), (2.0, 3.0)])
+
+        theta_values = pd.DataFrame([[0.0], [0.5]], columns=["theta"])
+        experiment_results = pest.experiment_results_at_theta(
+            theta_values, separate_experiments=True
+        )
+
+        self.assertEqual(list(experiment_results["experiment"]), [0, 1, 0, 1])
+        self.assertAlmostEqual(experiment_results.loc[0, "obj"], 1.0, places=8)
+        self.assertAlmostEqual(experiment_results.loc[1, "obj"], 1.0, places=8)
+        self.assertAlmostEqual(experiment_results.loc[2, "obj"], 0.25, places=8)
+        self.assertTrue(np.isnan(experiment_results.loc[3, "obj"]))
+        self.assertEqual(
+            list(experiment_results["solver_termination"]),
+            ["optimal", "optimal", "optimal", "infeasible"],
+        )
+
+    @unittest.skipIf(not ipopt_available, "The 'ipopt' solver is not available")
+    def test_objective_at_theta_separate_matches_combined(self):
+        pest = _build_estimator([(1.0, 2.0), (2.0, 4.0)])
+
+        theta_values = pd.DataFrame([[0.0], [1.0], [2.5]], columns=["theta"])
+        combined = pest.objective_at_theta(theta_values=theta_values)
+        separate = pest.objective_at_theta(
+            theta_values=theta_values, separate_experiments=True
+        )
+
+        pd.testing.assert_frame_equal(combined, separate)
 
     def test_invalid_solver_name_raises_runtimeerror(self):
         pest = _build_estimator([(1.0, 2.0), (2.0, 4.0)])
