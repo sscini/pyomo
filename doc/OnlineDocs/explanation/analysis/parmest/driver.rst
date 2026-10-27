@@ -106,6 +106,9 @@ Step 2: Load the Data and Create a List of Experiments
 Load the experimental data into Python and create an instance of your
 :class:`~pyomo.contrib.parmest.experiment.Experiment` class for each set of experimental data.
 In this example, each measurement of `y` is treated as a separate experiment.
+Experiments do not need to be alike: they can measure different outputs or a
+different number of data points. Within one experiment, all outputs must be
+measured at the same data points.
 
 .. doctest::
     :skipif: not __import__('pyomo.contrib.parmest.parmest').contrib.parmest.parmest.parmest_available
