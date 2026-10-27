@@ -2273,6 +2273,29 @@ class TestParmestBlockEF(unittest.TestCase):
         self.assertEqual(pest._return_theta_names(), ["theta[a]", "theta[b]"])
 
     @unittest.skipUnless(ipopt_available, "Test requires ipopt")
+    def test_cov_est_finite_difference_indexed_unknown_parameters(self):
+        # y = theta[a] + theta[b] * x is linear in theta, so the covariance is
+        # exactly s^2 * inv(X.T @ X) with s^2 = RSS / (n - p)
+        data = [(1.0, 2.0), (2.0, 3.5), (3.0, 4.0), (4.0, 6.5)]
+        pest = _build_indexed_theta_estimator(data)
+
+        obj, theta = pest.theta_est()
+        cov = pest.cov_est(method="finite_difference")
+
+        X = np.array([[1.0, x] for x, y in data])
+        y = np.array([y for x, y in data])
+        theta_hat = np.linalg.solve(X.T @ X, X.T @ y)
+        rss = np.sum((y - X @ theta_hat) ** 2)
+        cov_expected = rss / (len(y) - 2) * np.linalg.inv(X.T @ X)
+
+        self.assertEqual(list(cov.columns), ["theta[a]", "theta[b]"])
+        np.testing.assert_allclose(
+            cov.loc[["theta[a]", "theta[b]"], ["theta[a]", "theta[b]"]].values,
+            cov_expected,
+            rtol=1e-6,
+        )
+
+    @unittest.skipIf(not ipopt_available, "The 'ipopt' solver is not available")
     def test_cov_est_counts_expanded_indexed_unknown_parameters(self):
         pest = _build_indexed_theta_estimator([(1.0, 2.0), (2.0, 4.0)])
 

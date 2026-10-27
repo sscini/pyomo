@@ -570,8 +570,11 @@ def _compute_jacobian(experiment, theta_vals, step, solver, tee, solver_options)
     # grab the model
     model = _get_labeled_model(experiment)
 
+    # expand indexed unknown parameters to their scalar components
+    params, _, _ = _expanded_unknown_parameter_info(model)
+
     # fix the value of the unknown parameters to the estimated values
-    for param in model.unknown_parameters:
+    for param in params:
         param.fix(theta_vals[param.name])
 
     # re-solve the model with the estimated parameters
@@ -585,7 +588,7 @@ def _compute_jacobian(experiment, theta_vals, step, solver, tee, solver_options)
     assert_optimal_termination(results)
 
     # get the estimated parameter values
-    param_values = [p.value for p in model.unknown_parameters]
+    param_values = [p.value for p in params]
 
     # get the number of parameters and measured variables
     n_params = len(param_values)
@@ -594,7 +597,7 @@ def _compute_jacobian(experiment, theta_vals, step, solver, tee, solver_options)
     # compute the sensitivity of the measured variables w.r.t the parameters
     J = np.zeros((n_outputs, n_params))
 
-    for i, param in enumerate(model.unknown_parameters):
+    for i, param in enumerate(params):
         # store original value of the parameter
         orig_value = param_values[i]
 
@@ -900,8 +903,12 @@ def _kaug_FIM(
     # add the built-in objective function selected by the user
     model.objective = pyo.Objective(expr=obj_function, sense=pyo.minimize)
 
+    # expand indexed unknown parameters to their scalar components
+    params, params_names, _ = _expanded_unknown_parameter_info(model)
+    params_names = list(params_names)
+
     # fix the parameter values to the estimated values
-    for param in model.unknown_parameters:
+    for param in params:
         param.fix(theta_vals[param.name])
 
     solver = pyo.SolverFactory(solver)
@@ -912,8 +919,7 @@ def _kaug_FIM(
     assert_optimal_termination(results)
 
     # Probe the solved model for dsdp results (sensitivities s.t. parameters)
-    params_dict = {k.name: v for k, v in model.unknown_parameters.items()}
-    params_names = list(params_dict.keys())
+    params_dict = {p.name: theta_vals[p.name] for p in params}
 
     dsdp_re, col = get_dsdp(model, params_names, params_dict, tee=tee)
 
@@ -946,7 +952,7 @@ def _kaug_FIM(
     jac = [[] for _ in params_names]
 
     for d in range(len(dsdp_extract)):
-        for k, v in model.unknown_parameters.items():
+        for k in params:
             p = params_names.index(k.name)  # Index of parameter in np array
             sensi = dsdp_extract[d][p]
             jac[p].append(sensi)
