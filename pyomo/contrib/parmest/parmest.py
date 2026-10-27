@@ -1579,6 +1579,10 @@ class Estimator:
         solve_result = sol.solve(model, tee=self.tee, load_solutions=False)
         termination_condition = solve_result.solver.termination_condition
 
+        # Keep the solver results so the status of the most recent solve can
+        # be inspected, including after a non-optimal termination raises below
+        self.solver_results = solve_result
+
         if fix_theta and (
             len(solve_result.solution) == 0
             or termination_condition == pyo.TerminationCondition.infeasible
@@ -1980,6 +1984,11 @@ class Estimator:
         var_values: pd.DataFrame
             Variable values for each variable name in
             return_values (only for solver='ef_ipopt')
+
+        Raises a RuntimeError if the solver does not terminate optimally. The
+        solver results of the solve (e.g., ``solver_results.solver.status``
+        and ``solver_results.solver.termination_condition``) are stored in
+        the ``solver_results`` attribute in either case.
         """
         assert isinstance(solver, str)
         assert isinstance(return_values, list)
