@@ -635,6 +635,8 @@ def latex_printer(
         latex_component_map = ComponentMap()
         existing_components = ComponentSet()
     else:
+        # Copy so that the defaults added below do not modify the caller's map
+        latex_component_map = ComponentMap(latex_component_map)
         existing_components = ComponentSet(latex_component_map)
 
     isSingle = False
@@ -1269,11 +1271,17 @@ def latex_printer(
     rep_dict = {}
     for ky in reversed(list(latex_component_map)):
         if isinstance(ky, (pyo.Var, VarData)):
+            if ky not in variableMap:
+                # The map may name variables that this component does not use
+                continue
             overwrite_value = latex_component_map[ky]
             if ky not in existing_components:
                 overwrite_value = overwrite_value.replace('_', '\\_')
             rep_dict[variableMap[ky]] = overwrite_value
         elif isinstance(ky, (pyo.Param, ParamData)):
+            if ky not in parameterMap:
+                # The map may name parameters that this component does not use
+                continue
             overwrite_value = latex_component_map[ky]
             if ky not in existing_components:
                 overwrite_value = overwrite_value.replace('_', '\\_')
