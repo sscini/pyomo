@@ -1330,11 +1330,10 @@ class TestReactorDesign_DAE(unittest.TestCase):
             inv_reduced_hessian_barrier,
         )
 
-        # Number of datapoints.
-        # In this example, there are 20 time points and 1 experiment = 20 data points
-        # The data is indexed by time, so we do not consider the number of experimental
-        # outputs.
-        n = 20
+        # Number of residuals.
+        # In this example, there are 20 time points, 3 measured outputs (ca, cb,
+        # cc), and 1 experiment = 60 residuals in the SSE
+        n = 60
 
         # Compute covariance using parmest
         obj, theta = self.pest_df.theta_est()
@@ -2389,8 +2388,8 @@ class TestCountTotalExperiments(unittest.TestCase):
 
         total_points = parmest._count_total_experiments(exp_list)
 
-        # The current parmest convention counts datapoints for one output family.
-        self.assertEqual(total_points, 2)
+        # Every measured output is a residual: 2 experiments x 2 outputs
+        self.assertEqual(total_points, 4)
 
     def test_count_total_experiments_tuple_index_multi_output(self):
         exp_list = [
@@ -2404,7 +2403,27 @@ class TestCountTotalExperiments(unittest.TestCase):
 
         total_points = parmest._count_total_experiments(exp_list)
 
-        self.assertEqual(total_points, 4)
+        # 2 experiments x 2 outputs x 2 data points
+        self.assertEqual(total_points, 8)
+
+    @unittest.skipIf(not ipopt_available, "The 'ipopt' solver is not available")
+    def test_cov_est_multi_output_matches_linear_regression(self):
+        # y = theta + x and z = 2 * theta + x are linear in theta, so the
+        # covariance is exactly s^2 / (J.T @ J) with s^2 = RSS / (N - p) and
+        # N = 6 residuals (3 experiments x 2 outputs), not 3 data points
+        data = [(1.0, 2.0), (2.0, 4.5), (3.0, 4.0)]
+        pest = _build_estimator(data, include_second_output=True)
+        obj, theta = pest.theta_est()
+        cov = pest.cov_est(method="finite_difference")
+
+        J = np.array([1.0, 2.0] * len(data))
+        b = np.array([v for x, y in data for v in (y - x, 2.0 * y - x)])
+        theta_hat = (J @ b) / (J @ J)
+        rss = np.sum((b - J * theta_hat) ** 2)
+        var_expected = rss / (len(b) - 1) / (J @ J)
+
+        self.assertAlmostEqual(theta["theta"], theta_hat, places=6)
+        self.assertAlmostEqual(cov.loc["theta", "theta"], var_expected, places=6)
 
     def test_count_total_experiments_rejects_mismatched_output_lengths(self):
         exp_list = [

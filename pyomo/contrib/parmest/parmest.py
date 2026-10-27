@@ -449,12 +449,14 @@ def validate_experiment_outputs(output_vars):
 
 def _count_total_experiments(experiment_list):
     """
-    Counts the number of data points in the list of experiments
+    Counts the number of residuals (measured values) in the list of experiments
 
-    This function has been updated to avoid double counting data points in
-    cases where the "experiment_outputs" suffix contain keys that belong
-    to different output variables (e.g., `m.y1`, `m.y2`) which are measured at
-    the same data point
+    This is the n in the measurement error variance estimate
+    sigma^2 = sum(r**2) / (n - p). Every key of the "experiment_outputs"
+    suffix contributes one squared residual to the SSE objective, so each key
+    is counted, including outputs of different variables (e.g., `m.CA[t]`,
+    `m.CB[t]`) measured at the same data point. Counting only the data points
+    in that case would overestimate sigma^2 by (n - p) / (n_points - p).
 
     Assumptions:
 
@@ -463,11 +465,7 @@ def _count_total_experiments(experiment_list):
     Experiment outputs can be indexed variables (e.g., `m.CA[t]`, `m.CB[t]`,
     `m.C[t, "A"]`, `m.C[t, "B"]`). The data-point variable (e.g., `t`) must
     be the first index. Within each experiment, the output families are
-    expected to share the same time points. Across experiments, the output
-    families are expected to contain the same number of time points.
-
-    Future versions will allow for heterogeneity in the number of data points
-    across experiments and will require changes to this function.
+    expected to share the same time points.
 
     Parameters
     ----------
@@ -477,11 +475,11 @@ def _count_total_experiments(experiment_list):
 
     Returns
     -------
-    total_data_points : int
-        The total number of data points in the list of experiments
+    total_residuals : int
+        The total number of residuals in the list of experiments
     """
 
-    total_data_points = 0
+    total_residuals = 0
 
     for experiment in experiment_list:
         model = _get_labeled_model(experiment)
@@ -490,38 +488,10 @@ def _count_total_experiments(experiment_list):
         # check if the experiment outputs are defined correctly
         validate_experiment_outputs(output_vars)
 
-        # store the indices of the experiment outputs
-        indices = []
+        # one residual per measured output value
+        total_residuals += len(output_vars)
 
-        for output_var in output_vars.keys():
-            index = output_var.index()
-            indices.append(index)
-
-        # Case 1
-        # scalar outputs such as m.y1, m.y2,...
-        if all(index is None for index in indices):
-            total_data_points += 1
-        else:
-            # Case 2:
-            # outputs with one index, e.g., m.CA[t], m.CB[t],...
-            # outputs with two or more indices, e.g., m.C[t, "A"], m.C[t, "B"],...
-            # first index must be the data-point variable
-            # count unique time/sample indices within this experiment
-            experiment_data_points = set()
-
-            for index in indices:
-                index_tuple = _format_outputs_index_as_tuple(index)
-
-                # if the output has one index, this gives index itself
-                # if the output has two or more index, the first
-                # indexing must be the data index
-                data_point = index_tuple[0]
-
-                experiment_data_points.add(data_point)
-
-            total_data_points += len(experiment_data_points)
-
-    return total_data_points
+    return total_residuals
 
 
 class CovarianceMethod(Enum):
