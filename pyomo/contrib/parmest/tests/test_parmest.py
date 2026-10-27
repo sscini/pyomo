@@ -3886,5 +3886,515 @@ class TestSquareInitialization_RooneyBiegler_Deprecated(unittest.TestCase):
         self.pest.diagnostic_mode = False
 
 
+def _ishigami(unit_samples):
+    # Ishigami function with inputs uniform on [-pi, pi]
+    x = -np.pi + 2 * np.pi * unit_samples
+    return (
+        np.sin(x[:, 0])
+        + 7 * np.sin(x[:, 1]) ** 2
+        + 0.1 * x[:, 2] ** 4 * np.sin(x[:, 0])
+    )
+
+
+@unittest.skipIf(
+    not parmest.parmest_available,
+    "Cannot test parmest: required dependencies are missing",
+)
+class TestSensitivityKernels(unittest.TestCase):
+    def test_optimized_latin_hypercube(self):
+        lb, ub = np.zeros(11), np.ones(11)
+        plain = parmest._sample_initial_theta("latin_hypercube", 100, lb, ub, seed=1)
+        optimized = parmest._sample_initial_theta(
+            "latin_hypercube", 100, lb, ub, seed=1, lhs_optimization="random-cd"
+        )
+        np.testing.assert_array_equal(
+            optimized,
+            parmest._sample_initial_theta(
+                "latin_hypercube", 100, lb, ub, seed=1, lhs_optimization="random-cd"
+            ),
+        )
+        # Still a Latin hypercube: one point in each of the 100 strata
+        for j in range(11):
+            self.assertEqual(len(np.unique(np.floor(optimized[:, j] * 100))), 100)
+        # Less correlation between the sampled thetas
+        self.assertLess(
+            parmest._max_input_rank_correlation(optimized),
+            parmest._max_input_rank_correlation(plain),
+        )
+        self.assertLess(parmest._max_input_rank_correlation(optimized), 0.1)
+
+    def test_max_input_rank_correlation(self):
+        X = np.random.default_rng(0).uniform(size=(20, 2))
+        expected = abs(scipy.stats.spearmanr(X[:, 0], X[:, 1])[0])
+        self.assertAlmostEqual(parmest._max_input_rank_correlation(X), expected)
+        self.assertEqual(parmest._max_input_rank_correlation(X[:, :1]), 0.0)
+
+    def test_prcc_monotonic_outputs(self):
+        X = np.random.default_rng(0).uniform(size=(50, 3))
+        # Output is a monotonic function of x0 only
+        rho, p_value = parmest._partial_rank_correlation(X, np.exp(X[:, 0]))
+        self.assertAlmostEqual(rho[0], 1.0, places=10)
+        self.assertAlmostEqual(p_value[0], 0.0, places=10)
+        self.assertLess(abs(rho[1]), 0.5)
+        self.assertGreater(p_value[1], 0.05)
+        # Decreasing in x1
+        rho, _ = parmest._partial_rank_correlation(X, -X[:, 1] ** 3)
+        self.assertAlmostEqual(rho[1], -1.0, places=10)
+
+    def test_prcc_constant_output(self):
+        X = np.random.default_rng(0).uniform(size=(10, 2))
+        rho, p_value = parmest._partial_rank_correlation(X, np.ones(10))
+        self.assertTrue(np.all(np.isnan(rho)))
+        self.assertTrue(np.all(np.isnan(p_value)))
+
+    def test_srcc_and_prcc_definitions(self):
+        n, k = 200, 4
+        X = np.random.default_rng(1).uniform(size=(n, k))
+        y = X @ np.array([4.0, 3.0, 1.0, 0.0])
+        # partial=False is the Spearman rank correlation (n - 2 dof)
+        rho, p_value = parmest._partial_rank_correlation(X, y, partial=False)
+        for i in range(k):
+            expected = scipy.stats.spearmanr(X[:, i], y)
+            self.assertAlmostEqual(rho[i], expected[0], places=10)
+            self.assertAlmostEqual(p_value[i], expected[1], places=8)
+        # The PRCC is the partial correlation of the ranks, from the inverse of
+        # their correlation matrix (n - k - 1 dof)
+        ranks = np.column_stack(
+            [scipy.stats.rankdata(c) for c in np.column_stack([X, y]).T]
+        )
+        P = np.linalg.inv(np.corrcoef(ranks, rowvar=False))
+        expected = -P[:k, k] / np.sqrt(np.diag(P)[:k] * P[k, k])
+        rho_partial, p_partial = parmest._partial_rank_correlation(X, y)
+        np.testing.assert_allclose(rho_partial, expected, atol=1e-10)
+        t_stat = expected * np.sqrt((n - k - 1) / (1 - expected**2))
+        np.testing.assert_allclose(
+            p_partial, 2 * scipy.stats.t.sf(np.abs(t_stat), n - k - 1), atol=1e-10
+        )
+        # The other thetas dilute the Spearman coefficient
+        self.assertTrue(np.all(np.abs(rho_partial[:3]) > np.abs(rho[:3])))
+
+    def test_sobol_sample_matrices(self):
+        N, k = 8, 3
+        samples = parmest._sobol_sample_matrices(N, k, True, seed=1)
+        self.assertEqual(samples.shape, (N * (2 * k + 2), k))
+        blocks = samples.reshape(2 * k + 2, N, k)
+        A, B = blocks[0], blocks[1]
+        for i in range(k):
+            AB, BA = blocks[2 + i], blocks[2 + k + i]
+            np.testing.assert_array_equal(AB[:, i], B[:, i])
+            np.testing.assert_array_equal(np.delete(AB, i, 1), np.delete(A, i, 1))
+            np.testing.assert_array_equal(BA[:, i], A[:, i])
+            np.testing.assert_array_equal(np.delete(BA, i, 1), np.delete(B, i, 1))
+
+    def test_sobol_indices_ishigami(self):
+        # Analytical indices of the Ishigami function (a=7, b=0.1)
+        samples = parmest._sobol_sample_matrices(2048, 3, True, seed=1)
+        S1, ST, S2 = parmest._sobol_indices(_ishigami(samples), 3, True)
+        np.testing.assert_allclose(S1, [0.3139, 0.4424, 0.0], atol=0.02)
+        np.testing.assert_allclose(ST, [0.5576, 0.4424, 0.2437], atol=0.02)
+        self.assertAlmostEqual(S2[0, 2], 0.2437, delta=0.02)
+        self.assertAlmostEqual(S2[0, 1], 0.0, delta=0.02)
+        self.assertAlmostEqual(S2[1, 2], 0.0, delta=0.02)
+        self.assertTrue(np.all(np.isnan(S2[np.tril_indices(3)])))
+
+        # First order design (no BA matrices)
+        samples = parmest._sobol_sample_matrices(2048, 3, False, seed=1)
+        S1, ST, S2 = parmest._sobol_indices(_ishigami(samples), 3, False)
+        np.testing.assert_allclose(S1, [0.3139, 0.4424, 0.0], atol=0.02)
+        np.testing.assert_allclose(ST, [0.5576, 0.4424, 0.2437], atol=0.02)
+        self.assertIsNone(S2)
+
+    def test_sobol_indices_leave_out_nonfinite(self):
+        N, k = 64, 3
+        y = _ishigami(parmest._sobol_sample_matrices(N, k, False, seed=1))
+        # A failed solve in AB_2 for base sample 5 leaves out base sample 5
+        y_failed = y.copy()
+        y_failed[3 * N + 5] = np.nan
+        y_dropped = np.delete(y.reshape(k + 2, N), 5, axis=1).ravel()
+        for a, b in zip(
+            parmest._sobol_indices(y_failed, k, False)[:2],
+            parmest._sobol_indices(y_dropped, k, False)[:2],
+        ):
+            np.testing.assert_allclose(a, b)
+
+    def test_sobol_indices_constant_output(self):
+        S1, ST, S2 = parmest._sobol_indices(np.ones(8 * 6), 2, True)
+        self.assertTrue(np.all(np.isnan(S1)))
+        self.assertTrue(np.all(np.isnan(ST)))
+        self.assertTrue(np.all(np.isnan(S2)))
+
+    def test_morris_trajectories(self):
+        r, k, p = 5, 3, 4
+        delta = p / (2 * (p - 1))
+        samples, step_inputs, step_signs = parmest._morris_trajectories(r, k, p, seed=3)
+        self.assertEqual(samples.shape, (r * (k + 1), k))
+        # Every point is on the level grid
+        levels = samples * (p - 1)
+        np.testing.assert_allclose(levels, np.round(levels), atol=1e-12)
+        self.assertTrue(np.all((samples >= 0) & (samples <= 1)))
+        # Each step moves only the recorded input, by +/- delta
+        steps = np.diff(samples.reshape(r, k + 1, k), axis=1)
+        for t in range(r):
+            np.testing.assert_array_equal(np.sort(step_inputs[t]), np.arange(k))
+            for j in range(k):
+                expected = np.zeros(k)
+                expected[step_inputs[t, j]] = step_signs[t, j] * delta
+                np.testing.assert_allclose(steps[t, j], expected, atol=1e-12)
+
+    def test_morris_statistics_linear(self):
+        samples, step_inputs, step_signs = parmest._morris_trajectories(6, 3, 4, seed=3)
+        y = samples @ np.array([2.0, 0.0, -5.0])
+        mu, mu_star, sigma = parmest._morris_statistics(y, step_inputs, step_signs, 4)
+        np.testing.assert_allclose(mu, [2.0, 0.0, -5.0], atol=1e-12)
+        np.testing.assert_allclose(mu_star, [2.0, 0.0, 5.0], atol=1e-12)
+        np.testing.assert_allclose(sigma, [0.0, 0.0, 0.0], atol=1e-12)
+
+    def test_morris_statistics_nonlinear_and_nonfinite(self):
+        r, k = 8, 2
+        samples, step_inputs, step_signs = parmest._morris_trajectories(r, k, 4, seed=4)
+        # The effect of x0 depends on x1, so its elementary effects vary
+        y = samples[:, 0] * samples[:, 1]
+        _, mu_star, sigma = parmest._morris_statistics(y, step_inputs, step_signs, 4)
+        self.assertTrue(np.all(sigma > 0))
+
+        # A failed solve at the start of trajectory 0 removes one elementary
+        # effect of the first input moved
+        y[0] = np.nan
+        i = step_inputs[0, 0]
+        _, mu_star_nan, _ = parmest._morris_statistics(y, step_inputs, step_signs, 4)
+        self.assertTrue(np.all(np.isfinite(mu_star_nan)))
+        self.assertAlmostEqual(mu_star_nan[1 - i], mu_star[1 - i])
+
+        # Fewer than 2 elementary effects gives a NaN sigma
+        mu, _, sigma = parmest._morris_statistics(
+            np.full(r * (k + 1), np.nan), step_inputs, step_signs, 4
+        )
+        self.assertTrue(np.all(np.isnan(mu)))
+        self.assertTrue(np.all(np.isnan(sigma)))
+
+
+class TwoSolutionExperiment(Experiment):
+    def get_labeled_model(self):
+        m = pyo.ConcreteModel()
+        m.theta = pyo.Var(initialize=2.0, bounds=(0.0, 5.0))
+        m.theta.fix()
+        m.y = pyo.Var(initialize=0.5)
+        m.eq = pyo.Constraint(expr=(m.y - m.theta) ** 2 == 1.0)
+        m.experiment_outputs = pyo.Suffix(direction=pyo.Suffix.LOCAL)
+        m.experiment_outputs.update([(m.y, 0.0)])
+        m.unknown_parameters = pyo.Suffix(direction=pyo.Suffix.LOCAL)
+        m.unknown_parameters.update([(m.theta, pyo.ComponentUID(m.theta))])
+        m.measurement_error = pyo.Suffix(direction=pyo.Suffix.LOCAL)
+        m.measurement_error.update([(m.y, None)])
+        return m
+
+
+class _UnboundedThetaExperiment(LinearThetaExperiment):
+    def create_model(self):
+        super().create_model()
+        self.model.theta.setlb(None)
+        self.model.theta.setub(None)
+
+
+def _rooney_biegler_estimator(n_experiments=6):
+    from pyomo.contrib.parmest.examples.rooney_biegler.rooney_biegler import (
+        RooneyBieglerExperiment,
+    )
+
+    data = pd.DataFrame(
+        data=[[1, 8.3], [2, 10.3], [3, 19.0], [4, 16.0], [5, 15.6], [7, 19.8]],
+        columns=["hour", "y"],
+    )
+    exp_list = [RooneyBieglerExperiment(data.loc[i, :]) for i in range(n_experiments)]
+    hours = data["hour"].to_numpy()[:n_experiments]
+    return parmest.Estimator(exp_list, obj_function="SSE"), hours
+
+
+def _rooney_biegler_y(hours, theta_samples):
+    # Outputs of the Rooney-Biegler model, shape (n_samples, n_experiments)
+    asymptote = theta_samples[:, [0]]
+    rate_constant = theta_samples[:, [1]]
+    return asymptote * (1 - np.exp(-rate_constant * hours[None, :]))
+
+
+@unittest.skipIf(
+    not parmest.parmest_available,
+    "Cannot test parmest: required dependencies are missing",
+)
+class TestParmestSensitivity(unittest.TestCase):
+    # Bounds tighter than the model bounds, so every solve is well-posed
+    rb_bounds = {"asymptote": (10.0, 30.0), "rate_constant": (0.2, 1.0)}
+    rb_lb = np.array([10.0, 0.2])
+    rb_ub = np.array([30.0, 1.0])
+
+    def _check_index(self, df, n_experiments, outputs, theta_names):
+        self.assertEqual(list(df.index.names), ["experiment", "output", "parameter"])
+        expected = [
+            (e, o, p)
+            for e in range(n_experiments)
+            for o in outputs
+            for p in theta_names
+        ]
+        self.assertEqual(list(df.index), expected)
+
+    @unittest.skipIf(not ipopt_available, "The 'ipopt' solver is not available")
+    def test_prcc_rooney_biegler(self):
+        pest, hours = _rooney_biegler_estimator()
+        prcc = pest.sensitivity_prcc(n_samples=20, theta_bounds=self.rb_bounds, seed=1)
+        self._check_index(prcc, 6, ["y"], ["asymptote", "rate_constant"])
+        self.assertEqual(list(prcc.columns), ["PRCC", "p-value"])
+
+        # Same samples evaluated with the analytical model
+        theta = parmest._sample_initial_theta(
+            "latin_hypercube",
+            20,
+            self.rb_lb,
+            self.rb_ub,
+            seed=1,
+            lhs_optimization="random-cd",
+        )
+        y = _rooney_biegler_y(hours, theta)
+        for e in range(6):
+            rho, p_value = parmest._partial_rank_correlation(theta, y[:, e])
+            np.testing.assert_allclose(prcc.loc[(e, "y"), "PRCC"], rho, atol=1e-6)
+            np.testing.assert_allclose(
+                prcc.loc[(e, "y"), "p-value"], p_value, atol=1e-6
+            )
+        # The output increases with both parameters
+        self.assertTrue(np.all(prcc["PRCC"] > 0))
+
+        # Spearman coefficients of outputs rounded to whole numbers
+        srcc = pest.sensitivity_prcc(
+            n_samples=20,
+            theta_bounds=self.rb_bounds,
+            seed=1,
+            partial=False,
+            output_decimals=0,
+        )
+        self.assertEqual(list(srcc.columns), ["SRCC", "p-value"])
+        for e in range(6):
+            rho, _ = parmest._partial_rank_correlation(
+                theta, np.round(y[:, e]), partial=False
+            )
+            np.testing.assert_allclose(srcc.loc[(e, "y"), "SRCC"], rho, atol=1e-6)
+
+    @unittest.skipIf(not ipopt_available, "The 'ipopt' solver is not available")
+    def test_prcc_warns_on_correlated_samples(self):
+        pest, _ = _rooney_biegler_estimator(n_experiments=1)
+        theta = parmest._sample_initial_theta(
+            "uniform_random", 8, self.rb_lb, self.rb_ub, seed=3
+        )
+        max_corr = parmest._max_input_rank_correlation(theta)
+        self.assertGreater(max_corr, 0.1)
+        log = io.StringIO()
+        with LoggingIntercept(log, "pyomo.contrib.parmest", logging.WARNING):
+            pest.sensitivity_prcc(
+                n_samples=8,
+                sampling_method="uniform_random",
+                theta_bounds=self.rb_bounds,
+                seed=3,
+            )
+        self.assertIn(f"{max_corr:.3f}", log.getvalue())
+
+    @unittest.skipIf(not ipopt_available, "The 'ipopt' solver is not available")
+    def test_warmstart_with_multiple_solutions(self):
+        # (y - theta)^2 = 1 has the solutions theta - 1 and theta + 1. Every
+        # solve with "none" starts from y = 0.5, below both solutions, so it
+        # finds theta - 1.
+        pest = parmest.Estimator([TwoSolutionExperiment()])
+        theta_samples = np.array([[2.0], [4.0], [2.0]])
+        _, none = pest._simulate_outputs_at_theta(
+            theta_samples, ["theta"], "ipopt", warmstart="none"
+        )
+        _, previous = pest._simulate_outputs_at_theta(
+            theta_samples, ["theta"], "ipopt", warmstart="previous"
+        )
+        np.testing.assert_allclose(none[:, 0], [1.0, 3.0, 1.0], rtol=1e-6)
+        # The second solve at theta = 2 starts from y = 3 (a solution), so the
+        # same theta gives a different output
+        np.testing.assert_allclose(previous[:, 0], [1.0, 3.0, 3.0], rtol=1e-6)
+
+    @unittest.skipIf(not ipopt_available, "The 'ipopt' solver is not available")
+    def test_sobol_rooney_biegler(self):
+        pest, hours = _rooney_biegler_estimator(n_experiments=2)
+        N = 8
+        sobol, sobol_s2 = pest.sensitivity_sobol(
+            n_samples=N, calc_second_order=True, theta_bounds=self.rb_bounds, seed=1
+        )
+        self._check_index(sobol, 2, ["y"], ["asymptote", "rate_constant"])
+        self.assertEqual(list(sobol.columns), ["S1", "ST"])
+        self.assertEqual(
+            list(sobol_s2.index.names),
+            ["experiment", "output", "parameter_1", "parameter_2"],
+        )
+        self.assertEqual(
+            list(sobol_s2.index),
+            [(e, "y", "asymptote", "rate_constant") for e in range(2)],
+        )
+
+        # Same design evaluated with the analytical model
+        unit = parmest._sobol_sample_matrices(N, 2, True, seed=1)
+        y = _rooney_biegler_y(hours, self.rb_lb + (self.rb_ub - self.rb_lb) * unit)
+        for e in range(2):
+            S1, ST, S2 = parmest._sobol_indices(y[:, e], 2, True)
+            np.testing.assert_allclose(sobol.loc[(e, "y"), "S1"], S1, atol=1e-6)
+            np.testing.assert_allclose(sobol.loc[(e, "y"), "ST"], ST, atol=1e-6)
+            self.assertAlmostEqual(
+                sobol_s2.loc[(e, "y", "asymptote", "rate_constant"), "S2"],
+                S2[0, 1],
+                places=6,
+            )
+
+        # Without second order indices only one DataFrame is returned
+        sobol = pest.sensitivity_sobol(n_samples=4, theta_bounds=self.rb_bounds, seed=1)
+        self.assertIsInstance(sobol, pd.DataFrame)
+
+    @unittest.skipIf(not ipopt_available, "The 'ipopt' solver is not available")
+    def test_morris_rooney_biegler(self):
+        pest, hours = _rooney_biegler_estimator()
+        morris = pest.sensitivity_morris(
+            n_trajectories=5, theta_bounds=self.rb_bounds, seed=1
+        )
+        self._check_index(morris, 6, ["y"], ["asymptote", "rate_constant"])
+        self.assertEqual(list(morris.columns), ["mu", "mu_star", "sigma", "important"])
+
+        # Same trajectories evaluated with the analytical model
+        unit, step_inputs, step_signs = parmest._morris_trajectories(5, 2, 4, seed=1)
+        y = _rooney_biegler_y(hours, self.rb_lb + (self.rb_ub - self.rb_lb) * unit)
+        for e in range(6):
+            mu, mu_star, sigma = parmest._morris_statistics(
+                y[:, e], step_inputs, step_signs, 4
+            )
+            np.testing.assert_allclose(morris.loc[(e, "y"), "mu"], mu, atol=1e-6)
+            np.testing.assert_allclose(
+                morris.loc[(e, "y"), "mu_star"], mu_star, atol=1e-6
+            )
+            np.testing.assert_allclose(morris.loc[(e, "y"), "sigma"], sigma, atol=1e-6)
+            important = mu_star >= 0.5 * mu_star.max()
+            np.testing.assert_array_equal(morris.loc[(e, "y"), "important"], important)
+
+    @unittest.skipIf(not ipopt_available, "The 'ipopt' solver is not available")
+    def test_morris_subset_of_thetas(self):
+        # rate_constant stays at its value in the labeled model (0.5), so the
+        # output is linear in asymptote
+        pest, hours = _rooney_biegler_estimator()
+        morris = pest.sensitivity_morris(
+            n_trajectories=3,
+            theta_names="asymptote",
+            theta_bounds=self.rb_bounds,
+            seed=1,
+        )
+        self._check_index(morris, 6, ["y"], ["asymptote"])
+        np.testing.assert_allclose(
+            morris["mu"], 20.0 * (1 - np.exp(-0.5 * hours)), rtol=1e-6
+        )
+        np.testing.assert_allclose(morris["sigma"], 0.0, atol=1e-5)
+        self.assertTrue(morris["important"].all())
+
+    @unittest.skipIf(not ipopt_available, "The 'ipopt' solver is not available")
+    def test_morris_indexed_theta_and_model_bounds(self):
+        # y = theta[a] + 2 theta[b], with model bounds [-10, 10] on both
+        pest = parmest.Estimator(
+            [IndexedThetaExperiment(2.0, 3.0)], solver_options={"max_iter": 100}
+        )
+        morris = pest.sensitivity_morris(n_trajectories=3, seed=0)
+        self._check_index(morris, 1, ["y"], ["theta[a]", "theta[b]"])
+        np.testing.assert_allclose(morris["mu"], [20.0, 40.0], rtol=1e-6)
+        self.assertTrue(morris["important"].all())
+
+    @unittest.skipIf(not ipopt_available, "The 'ipopt' solver is not available")
+    def test_morris_multiple_outputs(self):
+        # y = theta + x and z = 2 theta + x, with theta in [-10, 10]
+        exp_list = [
+            LinearThetaExperiment(1.0, 2.0, include_second_output=True),
+            LinearThetaExperiment(2.0, 3.0, include_second_output=True),
+        ]
+        pest = parmest.Estimator(exp_list, obj_function="SSE")
+        morris = pest.sensitivity_morris(n_trajectories=3, seed=0)
+        self._check_index(morris, 2, ["y", "z"], ["theta"])
+        np.testing.assert_allclose(morris["mu"], [20.0, 40.0, 20.0, 40.0], rtol=1e-6)
+
+    @unittest.skipIf(not ipopt_available, "The 'ipopt' solver is not available")
+    def test_failed_solves_are_left_out(self):
+        # y = theta + 1 with y <= 2, so solves with theta > 1 are infeasible
+        pest = parmest.Estimator(
+            [BoundedLinearThetaExperiment(1.0, 2.0)], obj_function="SSE"
+        )
+        log = io.StringIO()
+        with LoggingIntercept(log, "pyomo.contrib.parmest", logging.WARNING):
+            prcc = pest.sensitivity_prcc(n_samples=20, seed=0)
+        self.assertRegex(log.getvalue(), r"\d+ of 20 solves did not terminate")
+        self.assertAlmostEqual(prcc.loc[(0, "y", "theta"), "PRCC"], 1.0)
+
+        # The levels in [-10, 4] are -10, -5.33, -0.67 and 4, so steps between
+        # -10 and -0.67 are feasible and steps between -5.33 and 4 are not
+        with LoggingIntercept(log, "pyomo.contrib.parmest", logging.WARNING):
+            morris = pest.sensitivity_morris(
+                n_trajectories=8, theta_bounds={"theta": (-10.0, 4.0)}, seed=0
+            )
+        self.assertAlmostEqual(morris.loc[(0, "y", "theta"), "mu"], 14.0, places=5)
+
+    def test_sensitivity_input_errors(self):
+        pest, _ = _rooney_biegler_estimator()
+        with self.assertRaisesRegex(ValueError, "Invalid theta names"):
+            pest.sensitivity_prcc(theta_names=["k1"])
+        with self.assertRaisesRegex(ValueError, "Duplicate theta names"):
+            pest.sensitivity_prcc(theta_names=["asymptote", "asymptote"])
+        with self.assertRaisesRegex(ValueError, "at least one theta name"):
+            pest.sensitivity_prcc(theta_names=[])
+        with self.assertRaisesRegex(TypeError, "theta_bounds must be a dict"):
+            pest.sensitivity_prcc(theta_bounds=[(10.0, 30.0), (0.2, 1.0)])
+        with self.assertRaisesRegex(ValueError, "Invalid theta names.*theta_bounds"):
+            pest.sensitivity_prcc(theta_bounds={"k1": (0.0, 1.0)})
+        with self.assertRaisesRegex(ValueError, "must be less than its upper"):
+            pest.sensitivity_prcc(theta_bounds={"asymptote": (30.0, 10.0)})
+        with self.assertRaisesRegex(ValueError, "must be finite"):
+            pest.sensitivity_prcc(theta_bounds={"asymptote": (10.0, np.inf)})
+        with self.assertRaisesRegex(ValueError, "needs a lower and upper bound"):
+            parmest.Estimator(
+                [_UnboundedThetaExperiment(1.0, 2.0)]
+            ).sensitivity_morris()
+
+        with self.assertRaisesRegex(TypeError, "n_samples must be an integer"):
+            pest.sensitivity_prcc(n_samples=10.0, theta_bounds=self.rb_bounds)
+        with self.assertRaisesRegex(ValueError, "number of varied thetas plus 1"):
+            pest.sensitivity_prcc(n_samples=3, theta_bounds=self.rb_bounds)
+        with self.assertRaisesRegex(ValueError, "Invalid multistart_sampling_method"):
+            pest.sensitivity_prcc(sampling_method="grid", theta_bounds=self.rb_bounds)
+        with self.assertRaisesRegex(TypeError, "output_decimals must be an integer"):
+            pest.sensitivity_prcc(output_decimals=1.5, theta_bounds=self.rb_bounds)
+        with self.assertRaisesRegex(ValueError, "warmstart must be either"):
+            pest.sensitivity_morris(warmstart="neighbor", theta_bounds=self.rb_bounds)
+        with self.assertRaisesRegex(TypeError, "n_samples must be an integer"):
+            pest.sensitivity_sobol(n_samples=8.0, theta_bounds=self.rb_bounds)
+        with self.assertRaisesRegex(ValueError, "n_samples must be at least 2"):
+            pest.sensitivity_sobol(n_samples=1, theta_bounds=self.rb_bounds)
+        with self.assertRaisesRegex(TypeError, "n_trajectories must be an integer"):
+            pest.sensitivity_morris(n_trajectories=4.0, theta_bounds=self.rb_bounds)
+        with self.assertRaisesRegex(ValueError, "n_trajectories must be at least 2"):
+            pest.sensitivity_morris(n_trajectories=1, theta_bounds=self.rb_bounds)
+        with self.assertRaisesRegex(TypeError, "num_levels must be an integer"):
+            pest.sensitivity_morris(num_levels=4.0, theta_bounds=self.rb_bounds)
+        with self.assertRaisesRegex(ValueError, "num_levels must be an even"):
+            pest.sensitivity_morris(num_levels=5, theta_bounds=self.rb_bounds)
+        with self.assertRaisesRegex(ValueError, "screening_threshold must be"):
+            pest.sensitivity_morris(
+                screening_threshold=1.5, theta_bounds=self.rb_bounds
+            )
+
+    def test_sensitivity_deprecated_interface(self):
+        with LoggingIntercept(io.StringIO(), "pyomo"):
+            pest = parmest.Estimator(
+                lambda data: pyo.ConcreteModel(), pd.DataFrame({"x": [1.0]}), ["theta"]
+            )
+        for method in (
+            pest.sensitivity_prcc,
+            pest.sensitivity_sobol,
+            pest.sensitivity_morris,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "deprecated parmest interface"):
+                method()
+
+
 if __name__ == "__main__":
     unittest.main()

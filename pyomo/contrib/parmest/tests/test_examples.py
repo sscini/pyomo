@@ -184,6 +184,19 @@ class TestReactorDesignExamples(unittest.TestCase):
 
         leaveNout_example.main()
 
+    def test_sensitivity_example(self):
+        from pyomo.contrib.parmest.examples.reactor_design import sensitivity_example
+
+        prcc, morris, sobol = sensitivity_example.main()
+        # At steady state, the outlet concentration of A does not depend on k2
+        self.assertLess(abs(morris.loc[(0, "ca", "k2"), "mu_star"]), 1e-6)
+        self.assertFalse(morris.loc[(0, "ca", "k2"), "important"])
+        # ca decreases with k1 and k3
+        self.assertLess(prcc.loc[(0, "ca", "k1"), "PRCC"], -0.9)
+        self.assertLess(prcc.loc[(0, "ca", "k3"), "PRCC"], -0.9)
+        # Morris screening for cb keeps k1 and k2
+        self.assertEqual(list(sobol.index.unique("parameter")), ["k1", "k2"])
+
     def test_timeseries_data_example(self):
         from pyomo.contrib.parmest.examples.reactor_design import (
             timeseries_data_example,

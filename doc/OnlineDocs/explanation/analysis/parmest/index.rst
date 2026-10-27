@@ -23,6 +23,7 @@ Index of parmest documentation
    driver.rst
    datarec.rst
    covariance.rst
+   sensitivity.rst
    scencreate.rst
    graphics.rst
    examples.rst

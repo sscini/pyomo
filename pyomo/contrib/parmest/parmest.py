@@ -550,10 +550,16 @@ class MultistartSamplingMethod(Enum):
 
 
 def _sample_initial_theta(
-    multistart_sampling_method, n_restarts, lower_bound, upper_bound, seed=None
+    multistart_sampling_method,
+    n_restarts,
+    lower_bound,
+    upper_bound,
+    seed=None,
+    lhs_optimization=None,
 ):
     """
-    Sample starting theta values within the theta bounds.
+    Sample theta values within the theta bounds (starting values for
+    theta_est_multistart, or samples for sensitivity_prcc).
 
     Parameters
     ----------
@@ -565,6 +571,11 @@ def _sample_initial_theta(
         Theta bounds.
     seed : int, optional
         Random seed. Default is None.
+    lhs_optimization : str, optional
+        Optimization of the Latin hypercube design, passed to
+        scipy.stats.qmc.LatinHypercube (e.g., "random-cd", which reduces
+        spurious correlation between thetas). Not used by the other methods.
+        Default is None (no optimization).
 
     Returns
     -------
@@ -593,7 +604,9 @@ def _sample_initial_theta(
         rng = np.random.default_rng(seed)
         samples = rng.random((n_restarts, n_theta))
     elif multistart_sampling_method == MultistartSamplingMethod.latin_hypercube:
-        sampler = scipy.stats.qmc.LatinHypercube(d=n_theta, seed=seed)
+        sampler = scipy.stats.qmc.LatinHypercube(
+            d=n_theta, seed=seed, optimization=lhs_optimization
+        )
         samples = sampler.random(n=n_restarts)
     else:
         # Scrambled, so the first point is not the origin
@@ -1097,6 +1110,300 @@ def _expand_prior_FIM(experiment, prior_FIM):
     )
 
     return expanded_prior_FIM
+
+
+def _partial_rank_correlation(X, y, partial=True):
+    """
+    Computes the partial rank correlation coefficient (PRCC) between each
+    input and the output, and its p-value
+
+    The inputs and output are rank transformed. For input i, the PRCC is the
+    correlation between the residuals of rank(x_i) and rank(y) after linear
+    regression on the ranks of the other inputs. If partial is False, the
+    other inputs are not regressed out, which gives the Spearman rank
+    correlation coefficient (SRCC).
+
+    Parameters
+    ----------
+    X : numpy.ndarray
+        Input samples, shape (n_samples, n_inputs)
+    y : numpy.ndarray
+        Output samples, shape (n_samples,)
+    partial : bool, optional
+        If False, compute the SRCC instead. Default is True.
+
+    Returns
+    -------
+    rho : numpy.ndarray
+        PRCC (or SRCC) of each input, shape (n_inputs,). NaN if y is
+        constant.
+    p_value : numpy.ndarray
+        Two-sided p-value of each coefficient (t-test with
+        n_samples - n_inputs - 1 degrees of freedom for the PRCC, and
+        n_samples - 2 for the SRCC), shape (n_inputs,)
+    """
+    n_samples, n_inputs = X.shape
+    rho = np.full(n_inputs, np.nan)
+    # One degree of freedom is lost for each input regressed out
+    dof = n_samples - n_inputs - 1 if partial else n_samples - 2
+    if np.ptp(y) == 0 or dof < 1:
+        return rho, np.full(n_inputs, np.nan)
+
+    rank_X = np.column_stack([scipy.stats.rankdata(X[:, i]) for i in range(n_inputs)])
+    rank_y = scipy.stats.rankdata(y)
+    ones = np.ones((n_samples, 1))
+
+    for i in range(n_inputs):
+        # Regress out the other inputs (with an intercept)
+        if partial:
+            Z = np.hstack([ones, np.delete(rank_X, i, axis=1)])
+        else:
+            Z = ones
+        res_x = rank_X[:, i] - Z @ np.linalg.lstsq(Z, rank_X[:, i], rcond=None)[0]
+        res_y = rank_y - Z @ np.linalg.lstsq(Z, rank_y, rcond=None)[0]
+        denom = np.sqrt(np.dot(res_x, res_x) * np.dot(res_y, res_y))
+        if denom > 0:
+            rho[i] = np.clip(np.dot(res_x, res_y) / denom, -1.0, 1.0)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t_stat = rho * np.sqrt(dof / (1.0 - rho**2))
+    p_value = 2.0 * scipy.stats.t.sf(np.abs(t_stat), dof)
+
+    return rho, p_value
+
+
+def _max_input_rank_correlation(X):
+    """
+    Largest absolute rank correlation between two columns of X (0 if X has
+    one column). PRCC assumes the sampled inputs are independent, so a large
+    value means the sample is not suitable for PRCC.
+    """
+    if X.shape[1] < 2:
+        return 0.0
+    rank_X = np.column_stack([scipy.stats.rankdata(X[:, i]) for i in range(X.shape[1])])
+    corr = np.corrcoef(rank_X, rowvar=False)
+    return float(np.max(np.abs(corr - np.eye(X.shape[1]))))
+
+
+def _sobol_sample_matrices(n_samples, n_dims, calc_second_order, seed=None):
+    """
+    Creates the Saltelli sample design used to estimate Sobol' indices
+
+    Matrices A and B (n_samples x n_dims each) are the two halves of a
+    scrambled Sobol' sequence in 2 * n_dims dimensions. AB_i is A with
+    column i taken from B, and BA_i is B with column i taken from A.
+
+    Parameters
+    ----------
+    n_samples : int
+        Number of base samples, N (a power of 2 gives the most even coverage)
+    n_dims : int
+        Number of inputs, k
+    calc_second_order : bool
+        If True, also add the BA_i matrices
+    seed : int, optional
+        Random seed. Default is None.
+
+    Returns
+    -------
+    samples : numpy.ndarray
+        Points in the unit hypercube, stacked as
+        [A; B; AB_1; ...; AB_k] or, if calc_second_order is True,
+        [A; B; AB_1; ...; AB_k; BA_1; ...; BA_k]. Shape is
+        (N * (k + 2), k) or (N * (2k + 2), k).
+    """
+    # Bounds of [0, 1] give unscaled samples
+    base = _sample_initial_theta(
+        MultistartSamplingMethod.sobol_sampling,
+        n_samples,
+        np.zeros(2 * n_dims),
+        np.ones(2 * n_dims),
+        seed=seed,
+    )
+    A = base[:, :n_dims]
+    B = base[:, n_dims:]
+
+    blocks = [A, B]
+    for i in range(n_dims):
+        AB = A.copy()
+        AB[:, i] = B[:, i]
+        blocks.append(AB)
+    if calc_second_order:
+        for i in range(n_dims):
+            BA = B.copy()
+            BA[:, i] = A[:, i]
+            blocks.append(BA)
+
+    return np.vstack(blocks)
+
+
+def _sobol_indices(y, n_dims, calc_second_order):
+    """
+    Estimates Sobol' indices from outputs evaluated on the design from
+    _sobol_sample_matrices
+
+    First order indices use the Saltelli (2010) estimator, total order
+    indices use the Jansen (1999) estimator and second order indices use the
+    Saltelli (2002) estimator. Base samples with a non-finite output in any
+    of the matrices are left out.
+
+    Parameters
+    ----------
+    y : numpy.ndarray
+        Outputs, in the order of the rows returned by _sobol_sample_matrices
+    n_dims : int
+        Number of inputs, k
+    calc_second_order : bool
+        If True, also estimate second order indices. Must match the design.
+
+    Returns
+    -------
+    S1 : numpy.ndarray
+        First order indices, shape (k,)
+    ST : numpy.ndarray
+        Total order indices, shape (k,)
+    S2 : numpy.ndarray or None
+        Second order indices, shape (k, k), with values above the diagonal
+        and NaN elsewhere. None if calc_second_order is False.
+    """
+    n_blocks = 2 * n_dims + 2 if calc_second_order else n_dims + 2
+    Y = np.asarray(y, dtype=float).reshape(n_blocks, -1)
+    Y = Y[:, np.all(np.isfinite(Y), axis=0)]
+
+    S1 = np.full(n_dims, np.nan)
+    ST = np.full(n_dims, np.nan)
+    S2 = np.full((n_dims, n_dims), np.nan) if calc_second_order else None
+
+    f_AB_both = np.concatenate([Y[0], Y[1]])
+    if Y.shape[1] < 2 or np.ptp(f_AB_both) == 0:
+        return S1, ST, S2
+
+    # Standardize so the output variance is 1, which improves the accuracy
+    # of the estimators
+    Y = (Y - f_AB_both.mean()) / f_AB_both.std()
+    f_A, f_B = Y[0], Y[1]
+    f_AB = Y[2 : n_dims + 2]
+
+    S1 = np.mean(f_B * (f_AB - f_A), axis=1)
+    ST = 0.5 * np.mean((f_A - f_AB) ** 2, axis=1)
+
+    if calc_second_order:
+        f_BA = Y[n_dims + 2 :]
+        for i in range(n_dims):
+            for j in range(i + 1, n_dims):
+                V_ij = np.mean(f_BA[i] * f_AB[j] - f_A * f_B)
+                S2[i, j] = V_ij - S1[i] - S1[j]
+
+    return S1, ST, S2
+
+
+def _morris_trajectories(n_trajectories, n_dims, num_levels, seed=None):
+    """
+    Creates the one-at-a-time trajectories used by the Morris method
+
+    Each input is scaled to [0, 1] and divided into num_levels levels.
+    Each trajectory starts at a random point on the level grid and moves
+    each input once, in random order and direction, by
+    :math:`\\Delta = p / (2 (p - 1))`, where p is num_levels.
+
+    Parameters
+    ----------
+    n_trajectories : int
+        Number of trajectories, r
+    n_dims : int
+        Number of inputs, k
+    num_levels : int
+        Number of grid levels, p (even)
+    seed : int, optional
+        Random seed. Default is None.
+
+    Returns
+    -------
+    samples : numpy.ndarray
+        Points in the unit hypercube, shape (r * (k + 1), k). Rows
+        t * (k + 1) to t * (k + 1) + k are trajectory t.
+    step_inputs : numpy.ndarray
+        Index of the input moved at each step, shape (r, k)
+    step_signs : numpy.ndarray
+        Direction (+1 or -1) of each step, shape (r, k)
+    """
+    rng = np.random.default_rng(seed)
+    delta = num_levels / (2.0 * (num_levels - 1))
+    # Start levels for which a step of +delta stays within [0, 1]
+    low_levels = np.arange(num_levels // 2) / (num_levels - 1)
+
+    samples = np.empty((n_trajectories, n_dims + 1, n_dims))
+    step_inputs = np.empty((n_trajectories, n_dims), dtype=int)
+    step_signs = np.empty((n_trajectories, n_dims))
+
+    for t in range(n_trajectories):
+        x_low = rng.choice(low_levels, size=n_dims)
+        step_up = rng.integers(0, 2, size=n_dims).astype(bool)
+        # Start at the low level for steps up and the high level for steps down
+        x = np.where(step_up, x_low, x_low + delta)
+        order = rng.permutation(n_dims)
+
+        samples[t, 0] = x
+        for j, i in enumerate(order):
+            x = x.copy()
+            x[i] = x_low[i] + delta if step_up[i] else x_low[i]
+            samples[t, j + 1] = x
+        step_inputs[t] = order
+        step_signs[t] = np.where(step_up[order], 1.0, -1.0)
+
+    samples = np.clip(samples, 0.0, 1.0)
+    return samples.reshape(-1, n_dims), step_inputs, step_signs
+
+
+def _morris_statistics(y, step_inputs, step_signs, num_levels):
+    """
+    Computes the Morris elementary effect statistics from outputs evaluated
+    along the trajectories from _morris_trajectories
+
+    The elementary effect of input i is
+    :math:`(y(x + \\Delta e_i) - y(x)) / \\Delta`, with x in the scaled
+    [0, 1] space. Elementary effects with a non-finite output are left out.
+
+    Parameters
+    ----------
+    y : numpy.ndarray
+        Outputs, in the order of the rows returned by _morris_trajectories
+    step_inputs : numpy.ndarray
+        Index of the input moved at each step, shape (r, k)
+    step_signs : numpy.ndarray
+        Direction (+1 or -1) of each step, shape (r, k)
+    num_levels : int
+        Number of grid levels, p
+
+    Returns
+    -------
+    mu : numpy.ndarray
+        Mean of the elementary effects, shape (k,)
+    mu_star : numpy.ndarray
+        Mean of the absolute elementary effects, shape (k,)
+    sigma : numpy.ndarray
+        Standard deviation of the elementary effects, shape (k,)
+    """
+    n_trajectories, n_dims = step_inputs.shape
+    delta = num_levels / (2.0 * (num_levels - 1))
+
+    Y = np.asarray(y, dtype=float).reshape(n_trajectories, n_dims + 1)
+    ee = np.empty((n_trajectories, n_dims))
+    ee[np.arange(n_trajectories)[:, None], step_inputs] = np.diff(Y, axis=1) / (
+        step_signs * delta
+    )
+
+    valid = np.isfinite(ee)
+    n_valid = valid.sum(axis=0)
+    ee_valid = np.where(valid, ee, 0.0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        mu = ee_valid.sum(axis=0) / n_valid
+        mu_star = np.abs(ee_valid).sum(axis=0) / n_valid
+        sq_dev = np.where(valid, ee - mu, 0.0) ** 2
+        sigma = np.sqrt(sq_dev.sum(axis=0) / np.maximum(n_valid - 1, 1))
+    sigma[n_valid < 2] = np.nan
+
+    return mu, mu_star, sigma
 
 
 class Estimator:
@@ -2597,6 +2904,587 @@ class Estimator:
             multistart_result.to_csv(file_name, index=False)
 
         return multistart_result, best_theta, best_obj
+
+    def _sensitivity_theta_info(self, theta_names=None, theta_bounds=None):
+        """
+        Get the names and bounds of the thetas varied in a sensitivity analysis
+
+        Parameters
+        ----------
+        theta_names : list of str, optional
+            Names of the thetas to vary. If None, all thetas are varied.
+            Default is None.
+        theta_bounds : dict, optional
+            Lower and upper bound, as a tuple, keyed by theta name. Varied
+            thetas not in theta_bounds use the bounds of the theta variable in
+            the labeled model. Bounds of thetas that are not varied are
+            ignored. Default is None.
+
+        Returns
+        -------
+        theta_names : list of str
+            Names of the thetas to vary
+        lower_bound : numpy.ndarray
+            Lower bound of each theta
+        upper_bound : numpy.ndarray
+            Upper bound of each theta
+
+        Raises
+        ------
+        RuntimeError
+            If the deprecated parmest interface is used.
+        ValueError
+            If a theta name is not valid or is repeated, or a bound is
+            missing, not finite, or the lower bound is not less than the
+            upper bound.
+        TypeError
+            If theta_bounds is not a dict.
+        """
+        if self.pest_deprecated is not None:
+            raise RuntimeError(
+                "Sensitivity analysis is not supported in the deprecated parmest "
+                "interface."
+            )
+
+        all_theta_names = list(self.estimator_theta_names)
+        if theta_names is None:
+            theta_names = all_theta_names
+        else:
+            if isinstance(theta_names, str):
+                theta_names = [theta_names]
+            theta_names = list(theta_names)
+            if len(theta_names) == 0:
+                raise ValueError("theta_names must contain at least one theta name.")
+            if len(theta_names) != len(set(theta_names)):
+                raise ValueError(
+                    f"Duplicate theta names are not allowed: {theta_names}"
+                )
+            invalid = [name for name in theta_names if name not in all_theta_names]
+            if invalid:
+                raise ValueError(
+                    f"Invalid theta names {invalid}. Choose from: {all_theta_names}."
+                )
+
+        if theta_bounds is None:
+            theta_bounds = {}
+        elif not isinstance(theta_bounds, dict):
+            raise TypeError(
+                "theta_bounds must be a dict mapping theta names to (lower, upper) "
+                "bounds."
+            )
+        invalid = [name for name in theta_bounds if name not in all_theta_names]
+        if invalid:
+            raise ValueError(
+                f"Invalid theta names {invalid} in theta_bounds. Choose from: "
+                f"{all_theta_names}."
+            )
+
+        # Get the variable bounds of the remaining thetas from the first
+        # experiment model that contains each theta
+        model_bounds = {}
+        for experiment in self.exp_list:
+            missing = [
+                n
+                for n in theta_names
+                if n not in theta_bounds and n not in model_bounds
+            ]
+            if not missing:
+                break
+            model = _get_labeled_model(experiment)
+            theta_vars, names, _ = _expanded_unknown_parameter_info(model)
+            for name, var in zip(names, theta_vars):
+                if name in missing:
+                    model_bounds[name] = (var.lb, var.ub)
+
+        lower_bound = []
+        upper_bound = []
+        for name in theta_names:
+            lb, ub = theta_bounds.get(name, model_bounds.get(name, (None, None)))
+            if lb is None or ub is None:
+                raise ValueError(
+                    f"Theta '{name}' needs a lower and upper bound. Set the bounds "
+                    "of the theta variable or supply them with theta_bounds."
+                )
+            if not (np.isfinite(lb) and np.isfinite(ub)):
+                raise ValueError(f"The bounds of theta '{name}' must be finite.")
+            if lb >= ub:
+                raise ValueError(
+                    f"The lower bound of theta '{name}' must be less than its "
+                    "upper bound."
+                )
+            lower_bound.append(float(lb))
+            upper_bound.append(float(ub))
+
+        return theta_names, np.array(lower_bound), np.array(upper_bound)
+
+    def _simulate_outputs_at_theta(
+        self, theta_samples, theta_names, solver, warmstart="none"
+    ):
+        """
+        Solve the labeled model of each experiment at each theta sample and
+        get the values of the experiment outputs
+
+        Each sample fixes the thetas in theta_names to the sampled values and
+        solves the labeled model (not the extensive form model). Thetas not in
+        theta_names stay at their values in the labeled model.
+
+        Parameters
+        ----------
+        theta_samples : numpy.ndarray
+            Theta values, shape (n_samples, len(theta_names))
+        theta_names : list of str
+            Names of the thetas in the columns of theta_samples
+        solver : str
+            Solver name, e.g., 'ipopt'
+        warmstart : str, optional
+            "none" starts each solve from the variable values of the labeled
+            model, so each sample is solved independently of the others.
+            "previous" starts each solve from the last optimal solution of the
+            same experiment. Default is "none".
+
+        Returns
+        -------
+        output_labels : list of tuple
+            (experiment number, output name) of each column of outputs
+        outputs : numpy.ndarray
+            Output values, shape (n_samples, number of outputs). NaN where the
+            solve did not terminate optimally.
+        """
+        if warmstart not in ("none", "previous"):
+            raise ValueError("warmstart must be either 'none' or 'previous'.")
+
+        sol = pyo.SolverFactory(solver)
+        if self.solver_options is not None:
+            for key in self.solver_options:
+                sol.options[key] = self.solver_options[key]
+
+        n_samples = theta_samples.shape[0]
+        output_labels = []
+        outputs = []
+        n_failed = 0
+        for exp_number, experiment in enumerate(self.exp_list):
+            model = _get_labeled_model(experiment)
+            _check_model_labels(model)
+            theta_vars, names, _ = _expanded_unknown_parameter_info(model)
+            theta_var_by_name = dict(zip(names, theta_vars))
+            for var in theta_vars:
+                var.fix()
+            # Columns of theta_samples for the thetas in this experiment
+            columns = [
+                (j, theta_var_by_name[name])
+                for j, name in enumerate(theta_names)
+                if name in theta_var_by_name
+            ]
+            y_hat_vars = list(model.experiment_outputs.keys())
+            # Values of the free variables before any solve
+            initial_values = [
+                (var, var.value)
+                for var in model.component_data_objects(pyo.Var, descend_into=True)
+                if not var.fixed
+            ]
+
+            exp_outputs = np.full((n_samples, len(y_hat_vars)), np.nan)
+            for s in range(n_samples):
+                if warmstart == "none":
+                    for var, value in initial_values:
+                        var.set_value(value, skip_validation=True)
+                for j, var in columns:
+                    var.fix(theta_samples[s, j])
+                # A non-optimal solution is not loaded, so with "previous" the
+                # next solve starts from the last optimal solution
+                results = sol.solve(model, tee=self.tee, load_solutions=False)
+                if check_optimal_termination(results):
+                    model.solutions.load_from(results)
+                    exp_outputs[s] = [pyo.value(y_hat) for y_hat in y_hat_vars]
+                else:
+                    n_failed += 1
+
+            output_labels.extend((exp_number, y_hat.name) for y_hat in y_hat_vars)
+            outputs.append(exp_outputs)
+
+        if n_failed > 0:
+            logger.warning(
+                "%d of %d solves did not terminate optimally. Their outputs are "
+                "NaN and are left out of the sensitivity analysis.",
+                n_failed,
+                n_samples * len(self.exp_list),
+            )
+
+        return output_labels, np.hstack(outputs)
+
+    def sensitivity_prcc(
+        self,
+        n_samples=100,
+        sampling_method="latin_hypercube",
+        theta_names=None,
+        theta_bounds=None,
+        seed=None,
+        solver="ipopt",
+        warmstart="none",
+        partial=True,
+        output_decimals=None,
+        lhs_optimization="random-cd",
+    ):
+        """
+        Global sensitivity analysis of the experiment outputs to theta using
+        partial rank correlation coefficients (PRCC)
+
+        Thetas are sampled uniformly within their bounds. For each sample, the
+        labeled model of each experiment is solved with theta fixed, and the
+        PRCC between each theta and each experiment output is computed. The
+        PRCC measures the strength and direction of a monotonic relationship
+        between a theta and an output, after removing the effect of the other
+        thetas.
+
+        Parameters
+        ----------
+        n_samples : int, optional
+            Number of theta samples. Must be greater than the number of varied
+            thetas plus 1. Default is 100.
+        sampling_method : str or MultistartSamplingMethod, optional
+            Method used to sample theta within its bounds: "latin_hypercube",
+            "uniform_random" or "sobol_sampling". Default is
+            "latin_hypercube".
+        theta_names : list of str, optional
+            Names of the thetas to vary. Thetas not varied stay at their
+            values in the labeled model. If None, all thetas are varied.
+            Default is None.
+        theta_bounds : dict, optional
+            Lower and upper bound, as a tuple, keyed by theta name. Varied
+            thetas not in theta_bounds use the bounds of the theta variable in
+            the labeled model, which must be finite. Bounds of thetas that are
+            not varied are ignored. Default is None.
+        seed : int, optional
+            Random seed for the sampling method. Default is None.
+        solver : str, optional
+            Solver name, e.g., 'ipopt'. Default is 'ipopt'.
+        warmstart : str, optional
+            "none" starts each solve from the variable values of the labeled
+            model. "previous" starts each solve from the last optimal
+            solution, which is faster but can make the outputs depend on the
+            sample order if the model has more than one solution (e.g., a
+            bistable steady state). Default is "none".
+        partial : bool, optional
+            If False, compute the Spearman rank correlation coefficient
+            (SRCC), which does not remove the effect of the other thetas.
+            Default is True.
+        output_decimals : int, optional
+            Round the outputs to this many decimals before ranking, so
+            differences smaller than the solver tolerance are ties rather than
+            arbitrary ranks. The rounding is absolute, so choose it from the
+            scale of the outputs. Default is None (no rounding).
+        lhs_optimization : str, optional
+            Optimization of the Latin hypercube design (see
+            scipy.stats.qmc.LatinHypercube). "random-cd" reduces spurious
+            correlation between the sampled thetas. None gives an unoptimized
+            design. Only used with "latin_hypercube". Default is "random-cd".
+
+        Returns
+        -------
+        prcc : pd.DataFrame
+            Indexed by ("experiment", "output", "parameter"), with columns
+            "PRCC" (or "SRCC" if partial is False, between -1 and 1) and
+            "p-value" (two-sided t-test of a zero coefficient). Both are NaN
+            if the output does not change.
+
+        Notes
+        -----
+        PRCC assumes each output changes monotonically with each theta, and
+        that the sampled thetas are independent. A warning is logged if two
+        sampled thetas have a rank correlation above 0.1. Solves that do not
+        terminate optimally are left out.
+        """
+        theta_names, lower_bound, upper_bound = self._sensitivity_theta_info(
+            theta_names, theta_bounds
+        )
+        if not isinstance(n_samples, int):
+            raise TypeError("n_samples must be an integer.")
+        if n_samples <= len(theta_names) + 1:
+            raise ValueError(
+                "n_samples must be greater than the number of varied thetas plus 1."
+            )
+        if output_decimals is not None and not isinstance(output_decimals, int):
+            raise TypeError("output_decimals must be an integer or None.")
+
+        theta_samples = _sample_initial_theta(
+            sampling_method,
+            n_samples,
+            lower_bound,
+            upper_bound,
+            seed=seed,
+            lhs_optimization=lhs_optimization,
+        )
+        max_corr = _max_input_rank_correlation(theta_samples)
+        if max_corr > 0.1:
+            logger.warning(
+                "The largest rank correlation between two sampled thetas is "
+                "%.3f. PRCC assumes independent thetas; increase n_samples or "
+                "use 'latin_hypercube' sampling.",
+                max_corr,
+            )
+        output_labels, outputs = self._simulate_outputs_at_theta(
+            theta_samples, theta_names, solver, warmstart
+        )
+        if output_decimals is not None:
+            outputs = np.round(outputs, output_decimals)
+
+        rows = []
+        index = []
+        for col, (exp_number, output_name) in enumerate(output_labels):
+            ok = np.isfinite(outputs[:, col])
+            rho, p_value = _partial_rank_correlation(
+                theta_samples[ok], outputs[ok, col], partial=partial
+            )
+            for i, name in enumerate(theta_names):
+                index.append((exp_number, output_name, name))
+                rows.append((rho[i], p_value[i]))
+
+        return pd.DataFrame(
+            rows,
+            index=pd.MultiIndex.from_tuples(
+                index, names=["experiment", "output", "parameter"]
+            ),
+            columns=["PRCC" if partial else "SRCC", "p-value"],
+        )
+
+    def sensitivity_sobol(
+        self,
+        n_samples=64,
+        calc_second_order=False,
+        theta_names=None,
+        theta_bounds=None,
+        seed=None,
+        solver="ipopt",
+        warmstart="none",
+    ):
+        """
+        Global sensitivity analysis of the experiment outputs to theta using
+        variance-based Sobol' indices
+
+        Thetas are treated as independent and uniformly distributed within
+        their bounds. The Saltelli sample design is built from a scrambled
+        Sobol' sequence, the labeled model of each experiment is solved with
+        theta fixed at each sample, and the Sobol' indices of each experiment
+        output are estimated. The first order index (S1) is the fraction of the
+        output variance due to a theta alone. The total order index (ST)
+        also includes the interactions of that theta with the other thetas.
+
+        Parameters
+        ----------
+        n_samples : int, optional
+            Number of base samples, N. The model of each experiment is solved
+            N * (k + 2) times, or N * (2k + 2) times if calc_second_order is
+            True, where k is the number of varied thetas. A power of 2 gives
+            the most even coverage. Default is 64.
+        calc_second_order : bool, optional
+            If True, also estimate the second order indices (S2), the fraction
+            of the output variance due to the interaction of each pair of
+            thetas. Default is False.
+        theta_names : list of str, optional
+            Names of the thetas to vary. Thetas not varied stay at their
+            values in the labeled model. If None, all thetas are varied.
+            Default is None.
+        theta_bounds : dict, optional
+            Lower and upper bound, as a tuple, keyed by theta name. Varied
+            thetas not in theta_bounds use the bounds of the theta variable in
+            the labeled model, which must be finite. Bounds of thetas that are
+            not varied are ignored. Default is None.
+        seed : int, optional
+            Random seed for the Sobol' sequence. Default is None.
+        solver : str, optional
+            Solver name, e.g., 'ipopt'. Default is 'ipopt'.
+        warmstart : str, optional
+            "none" starts each solve from the variable values of the labeled
+            model. "previous" starts each solve from the last optimal
+            solution (see sensitivity_prcc). Default is "none".
+
+        Returns
+        -------
+        sobol : pd.DataFrame
+            Indexed by ("experiment", "output", "parameter"), with columns
+            "S1" and "ST". Both are NaN if the output does not change.
+        sobol_second_order : pd.DataFrame
+            Only returned when calc_second_order is True. Indexed by
+            ("experiment", "output", "parameter_1", "parameter_2"), one row
+            per pair of thetas, with column "S2".
+
+        Notes
+        -----
+        Estimates use the Saltelli (2010) estimator for S1, the Jansen (1999)
+        estimator for ST and the Saltelli (2002) estimator for S2. Small
+        negative values are sampling error and shrink as n_samples increases.
+        Base samples with a solve that did not terminate optimally are left
+        out.
+        """
+        theta_names, lower_bound, upper_bound = self._sensitivity_theta_info(
+            theta_names, theta_bounds
+        )
+        if not isinstance(n_samples, int):
+            raise TypeError("n_samples must be an integer.")
+        if n_samples < 2:
+            raise ValueError("n_samples must be at least 2.")
+
+        n_theta = len(theta_names)
+        unit_samples = _sobol_sample_matrices(
+            n_samples, n_theta, calc_second_order, seed
+        )
+        theta_samples = lower_bound + (upper_bound - lower_bound) * unit_samples
+        output_labels, outputs = self._simulate_outputs_at_theta(
+            theta_samples, theta_names, solver, warmstart
+        )
+
+        rows = []
+        index = []
+        rows_s2 = []
+        index_s2 = []
+        for col, (exp_number, output_name) in enumerate(output_labels):
+            S1, ST, S2 = _sobol_indices(outputs[:, col], n_theta, calc_second_order)
+            for i, name in enumerate(theta_names):
+                index.append((exp_number, output_name, name))
+                rows.append((S1[i], ST[i]))
+            if calc_second_order:
+                for i in range(n_theta):
+                    for j in range(i + 1, n_theta):
+                        index_s2.append(
+                            (exp_number, output_name, theta_names[i], theta_names[j])
+                        )
+                        rows_s2.append(S2[i, j])
+
+        sobol = pd.DataFrame(
+            rows,
+            index=pd.MultiIndex.from_tuples(
+                index, names=["experiment", "output", "parameter"]
+            ),
+            columns=["S1", "ST"],
+        )
+        if not calc_second_order:
+            return sobol
+
+        sobol_second_order = pd.DataFrame(
+            {"S2": rows_s2},
+            index=pd.MultiIndex.from_tuples(
+                index_s2, names=["experiment", "output", "parameter_1", "parameter_2"]
+            ),
+        )
+        return sobol, sobol_second_order
+
+    def sensitivity_morris(
+        self,
+        n_trajectories=10,
+        num_levels=4,
+        screening_threshold=0.5,
+        theta_names=None,
+        theta_bounds=None,
+        seed=None,
+        solver="ipopt",
+        warmstart="none",
+    ):
+        """
+        Global sensitivity screening of the experiment outputs to theta using
+        the Morris method of elementary effects
+
+        Each theta is scaled to [0, 1] within its bounds and divided into
+        num_levels levels. Each trajectory starts at a random point on this
+        grid and changes one theta at a time by
+        :math:`\\Delta = p / (2 (p - 1))`, where p is num_levels, solving the
+        labeled model of each experiment with theta fixed at each point. The
+        elementary effect of a theta is the change in an output divided by
+        :math:`\\Delta`. The statistics of the elementary effects screen the
+        thetas: a small mu_star means the theta has little effect on the
+        output, and a large sigma means the effect is nonlinear or depends on
+        the other thetas.
+
+        Parameters
+        ----------
+        n_trajectories : int, optional
+            Number of trajectories, r (at least 2). The model of each
+            experiment is solved r * (k + 1) times, where k is the number of
+            varied thetas. Default is 10.
+        num_levels : int, optional
+            Number of grid levels, p (even). Default is 4.
+        screening_threshold : float, optional
+            A theta is marked as important for an output if its mu_star is at
+            least screening_threshold times the largest mu_star for that
+            output. Must be between 0 and 1. Default is 0.5.
+        theta_names : list of str, optional
+            Names of the thetas to vary. Thetas not varied stay at their
+            values in the labeled model. If None, all thetas are varied.
+            Default is None.
+        theta_bounds : dict, optional
+            Lower and upper bound, as a tuple, keyed by theta name. Varied
+            thetas not in theta_bounds use the bounds of the theta variable in
+            the labeled model, which must be finite. Bounds of thetas that are
+            not varied are ignored. Default is None.
+        seed : int, optional
+            Random seed for the trajectories. Default is None.
+        solver : str, optional
+            Solver name, e.g., 'ipopt'. Default is 'ipopt'.
+        warmstart : str, optional
+            "none" starts each solve from the variable values of the labeled
+            model. "previous" starts each solve from the last optimal
+            solution, i.e., the previous point of the trajectory (see
+            sensitivity_prcc). Default is "none".
+
+        Returns
+        -------
+        morris : pd.DataFrame
+            Indexed by ("experiment", "output", "parameter"), with columns
+            "mu" (mean elementary effect), "mu_star" (mean absolute
+            elementary effect), "sigma" (standard deviation of the elementary
+            effects) and "important" (screening result).
+
+        Notes
+        -----
+        Elementary effects are computed in the scaled [0, 1] space, so they
+        are comparable between thetas with different units. Elementary
+        effects with a solve that did not terminate optimally are left out.
+        The thetas marked as important for any output can be used as
+        theta_names in sensitivity_sobol, e.g.,
+        ``morris[morris["important"]].index.unique("parameter")``.
+        """
+        theta_names, lower_bound, upper_bound = self._sensitivity_theta_info(
+            theta_names, theta_bounds
+        )
+        if not isinstance(n_trajectories, int):
+            raise TypeError("n_trajectories must be an integer.")
+        if n_trajectories < 2:
+            raise ValueError("n_trajectories must be at least 2.")
+        if not isinstance(num_levels, int):
+            raise TypeError("num_levels must be an integer.")
+        if num_levels < 2 or num_levels % 2 != 0:
+            raise ValueError("num_levels must be an even integer of at least 2.")
+        if not 0 <= screening_threshold <= 1:
+            raise ValueError("screening_threshold must be between 0 and 1.")
+
+        unit_samples, step_inputs, step_signs = _morris_trajectories(
+            n_trajectories, len(theta_names), num_levels, seed
+        )
+        theta_samples = lower_bound + (upper_bound - lower_bound) * unit_samples
+        output_labels, outputs = self._simulate_outputs_at_theta(
+            theta_samples, theta_names, solver, warmstart
+        )
+
+        rows = []
+        index = []
+        for col, (exp_number, output_name) in enumerate(output_labels):
+            mu, mu_star, sigma = _morris_statistics(
+                outputs[:, col], step_inputs, step_signs, num_levels
+            )
+            max_mu_star = np.nanmax(mu_star) if np.any(np.isfinite(mu_star)) else 0.0
+            important = (mu_star >= screening_threshold * max_mu_star) & (
+                max_mu_star > 0
+            )
+            for i, name in enumerate(theta_names):
+                index.append((exp_number, output_name, name))
+                rows.append((mu[i], mu_star[i], sigma[i], bool(important[i])))
+
+        return pd.DataFrame(
+            rows,
+            index=pd.MultiIndex.from_tuples(
+                index, names=["experiment", "output", "parameter"]
+            ),
+            columns=["mu", "mu_star", "sigma", "important"],
+        )
 
     def _normalize_theta_dataframe(self, theta_values, model=None):
         """
