@@ -751,12 +751,29 @@ def compute_covariance_matrix(
 
         FIM += expanded_prior_FIM * regularization_weight
 
+    # check that the FIM is nonsingular before inverting it. np.linalg.inv only
+    # fails for an exactly singular matrix; a numerically singular FIM would
+    # give a meaningless covariance matrix, so it is an error here too
+    rank = np.linalg.matrix_rank(FIM)
+    if rank < FIM.shape[0]:
+        eigen_values, eigen_vectors = np.linalg.eigh(FIM)
+        null_direction = eigen_vectors[:, 0]
+        loadings = ", ".join(
+            f"{name} ({weight:.3g})"
+            for name, weight in zip(theta_vals.keys(), null_direction)
+            if abs(weight) > 1e-3
+        )
+        raise RuntimeError(
+            f"The FIM is singular (rank {rank} of {FIM.shape[0]}), so the "
+            f"covariance matrix is not defined: the data do not determine all "
+            f"parameters. The direction with the smallest eigenvalue "
+            f"({eigen_values[0]:.3g}) involves: {loadings}. Consider fixing or "
+            f"reparameterizing these parameters, collecting more informative "
+            f"data, or adding prior information (regularization='L2')."
+        )
+
     # calculate the covariance matrix
-    try:
-        cov = np.linalg.inv(FIM)
-    except np.linalg.LinAlgError:
-        cov = np.linalg.pinv(FIM)
-        logger.warning("The FIM is singular. Using pseudo-inverse instead.")
+    cov = np.linalg.inv(FIM)
 
     # check if the covariance matrix is positive semi-definite
     eigen_values = np.linalg.eigvalsh(cov)
