@@ -21,6 +21,7 @@ from pyomo.common.dependencies import (
     scipy,
     scipy_available,
     attempt_import,
+    check_min_version,
 )
 
 logger = logging.getLogger('pyomo.core')
@@ -1105,9 +1106,17 @@ class Simulator:
             dae['z'] = zall
             dae['alg'] = algall
 
-        integrator_options['grid'] = tsim
-        integrator_options['output_t0'] = True
-        F = casadi.integrator('F', integrator, dae, integrator_options)
+        if check_min_version(casadi, '3.6'):
+            # The 'grid' and 'output_t0' options were deprecated in
+            # CasADi 3.6. Including tsim[0] in the output grid is
+            # equivalent to output_t0=True.
+            F = casadi.integrator(
+                'F', integrator, dae, tsim[0], tsim, integrator_options
+            )
+        else:
+            integrator_options['grid'] = tsim
+            integrator_options['output_t0'] = True
+            F = casadi.integrator('F', integrator, dae, integrator_options)
         sol = F(x0=initcon)
         profile = sol['xf'].full().T
 
@@ -1145,8 +1154,12 @@ class Simulator:
             dae['z'] = zall
             dae['alg'] = algall
 
-        integrator_options['tf'] = 1.0
-        F = casadi.integrator('F', integrator, dae, integrator_options)
+        if check_min_version(casadi, '3.6'):
+            # The 'tf' option was deprecated in CasADi 3.6
+            F = casadi.integrator('F', integrator, dae, 0.0, 1.0, integrator_options)
+        else:
+            integrator_options['tf'] = 1.0
+            F = casadi.integrator('F', integrator, dae, integrator_options)
         N = len(tsim)
 
         # This approach removes the time scaling from tsim so must
