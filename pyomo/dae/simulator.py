@@ -1152,8 +1152,7 @@ class Simulator:
         # This approach removes the time scaling from tsim so must
         # create an array with the time step between consecutive
         # time points
-        tsimtemp = np.hstack([0, tsim[1:] - tsim[0:-1]])
-        tsimtemp.shape = (1, len(tsimtemp))
+        tsimtemp = np.hstack([0, tsim[1:] - tsim[0:-1]]).reshape(1, -1)
 
         palltemp = [casadi.DM(tsimtemp)]
 
