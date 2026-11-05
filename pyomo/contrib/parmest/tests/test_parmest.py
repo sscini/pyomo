@@ -1337,11 +1337,10 @@ class TestReactorDesign_DAE(unittest.TestCase):
             inv_reduced_hessian_barrier,
         )
 
-        # Number of datapoints.
-        # In this example, there are 20 time points and 1 experiment = 20 data points
-        # The data is indexed by time, so we do not consider the number of experimental
-        # outputs.
-        n = 20
+        # Number of residuals.
+        # In this example, there are 20 time points, 3 measured outputs (ca, cb,
+        # cc), and 1 experiment = 60 residuals in the SSE
+        n = 60
 
         # Compute covariance using parmest
         obj, theta = self.pest_df.theta_est()
@@ -2518,8 +2517,8 @@ class TestCountTotalExperiments(unittest.TestCase):
 
         total_points = parmest._count_total_experiments(exp_list)
 
-        # The current parmest convention counts datapoints for one output family.
-        self.assertEqual(total_points, 2)
+        # Every measured output is a residual: 2 experiments x 2 outputs
+        self.assertEqual(total_points, 4)
 
     def test_count_total_experiments_tuple_index_multi_output(self):
         exp_list = [
@@ -2533,7 +2532,27 @@ class TestCountTotalExperiments(unittest.TestCase):
 
         total_points = parmest._count_total_experiments(exp_list)
 
-        self.assertEqual(total_points, 4)
+        # 2 experiments x 2 outputs x 2 data points
+        self.assertEqual(total_points, 8)
+
+    @unittest.skipIf(not ipopt_available, "The 'ipopt' solver is not available")
+    def test_cov_est_multi_output_matches_linear_regression(self):
+        # y = theta + x and z = 2 * theta + x are linear in theta, so the
+        # covariance is exactly s^2 / (J.T @ J) with s^2 = RSS / (N - p) and
+        # N = 6 residuals (3 experiments x 2 outputs), not 3 data points
+        data = [(1.0, 2.0), (2.0, 4.5), (3.0, 4.0)]
+        pest = _build_estimator(data, include_second_output=True)
+        obj, theta = pest.theta_est()
+        cov = pest.cov_est(method="finite_difference")
+
+        J = np.array([1.0, 2.0] * len(data))
+        b = np.array([v for x, y in data for v in (y - x, 2.0 * y - x)])
+        theta_hat = (J @ b) / (J @ J)
+        rss = np.sum((b - J * theta_hat) ** 2)
+        var_expected = rss / (len(b) - 1) / (J @ J)
+
+        self.assertAlmostEqual(theta["theta"], theta_hat, places=6)
+        self.assertAlmostEqual(cov.loc["theta", "theta"], var_expected, places=6)
 
     def test_count_total_experiments_rejects_mismatched_output_lengths(self):
         exp_list = [
@@ -2573,6 +2592,78 @@ class TestCountTotalExperiments(unittest.TestCase):
             "The first index of experiment outputs must be the data point",
         ):
             parmest._count_total_experiments(exp_list)
+
+
+class HeterogeneousOutputExperiment(Experiment):
+    # Measures either y[t] = theta * t or z[t] = 2 * theta * t, so experiments
+    # can differ in the output measured and in the number of data points
+    def __init__(self, output, data):
+        self.output = output
+        self.data = dict(data)
+        self.model = None
+
+    def create_model(self):
+        m = pyo.ConcreteModel()
+
+        m.T = pyo.Set(initialize=sorted(self.data), ordered=True)
+        m.theta = pyo.Var(initialize=1.0, bounds=(-10.0, 10.0))
+        m.y = pyo.Var(m.T, initialize=0.0)
+        slope = 1.0 if self.output == "y" else 2.0
+
+        @m.Constraint(m.T)
+        def y_link(m, t):
+            return m.y[t] == slope * m.theta * t
+
+        self.model = m
+
+    def label_model(self):
+        m = self.model
+
+        m.experiment_outputs = pyo.Suffix(direction=pyo.Suffix.LOCAL)
+        m.experiment_outputs.update((m.y[t], v) for t, v in self.data.items())
+
+        m.unknown_parameters = pyo.Suffix(direction=pyo.Suffix.LOCAL)
+        m.unknown_parameters.update([(m.theta, pyo.ComponentUID(m.theta))])
+
+        m.measurement_error = pyo.Suffix(direction=pyo.Suffix.LOCAL)
+        m.measurement_error.update((m.y[t], None) for t in self.data)
+
+    def get_labeled_model(self):
+        self.create_model()
+        self.label_model()
+        return self.model
+
+
+@unittest.skipIf(
+    not parmest.parmest_available,
+    "Cannot test parmest: required dependencies are missing",
+)
+@unittest.skipIf(not ipopt_available, "The 'ipopt' solver is not available")
+class TestHeterogeneousExperiments(unittest.TestCase):
+    def test_different_outputs_and_data_points_across_experiments(self):
+        # Experiment 0 measures y at 3 times; experiment 1 measures z at 2
+        # times. The model is linear in theta, so theta and its covariance
+        # equal the exact linear-regression results over the 5 residuals.
+        data_y = {1.0: 1.1, 2.0: 1.9, 3.0: 3.2}
+        data_z = {1.0: 2.1, 2.0: 3.8}
+        exp_list = [
+            HeterogeneousOutputExperiment("y", data_y),
+            HeterogeneousOutputExperiment("z", data_z),
+        ]
+
+        pest = parmest.Estimator(exp_list, obj_function="SSE")
+        obj, theta = pest.theta_est()
+        cov = pest.cov_est(method="finite_difference")
+
+        J = np.array([t for t in data_y] + [2.0 * t for t in data_z])
+        b = np.array(list(data_y.values()) + list(data_z.values()))
+        theta_hat = (J @ b) / (J @ J)
+        rss = np.sum((b - J * theta_hat) ** 2)
+        var_expected = rss / (len(b) - 1) / (J @ J)
+
+        self.assertEqual(parmest._count_total_experiments(exp_list), 5)
+        self.assertAlmostEqual(theta["theta"], theta_hat, places=6)
+        self.assertAlmostEqual(cov.loc["theta", "theta"], var_expected, places=6)
 
 
 ###########################
