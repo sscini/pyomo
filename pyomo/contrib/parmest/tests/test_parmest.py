@@ -2464,6 +2464,28 @@ class TestParmestBlockEF(unittest.TestCase):
         self.assertAlmostEqual(obj_at_theta.loc[0, "theta"], 0.0, places=8)
         self.assertAlmostEqual(obj_at_theta.loc[0, "obj"], 0.5, places=8)
 
+    def test_missing_output_value_raises_naming_output(self):
+        # A NaN measured value would otherwise reach IPOPT and fail without
+        # naming the data point
+        pest = _build_estimator([(1.0, 2.0), (2.0, float("nan"))])
+
+        with self.assertRaisesRegex(
+            ValueError, r"missing measured values \(None or NaN\): \['y'\]"
+        ):
+            pest.theta_est()
+
+    def test_missing_output_value_check_sse_weighted(self):
+        m = pyo.ConcreteModel()
+        m.y = pyo.Var([0, 1], initialize=0.0)
+        m.experiment_outputs = pyo.Suffix(direction=pyo.Suffix.LOCAL)
+        m.experiment_outputs.update([(m.y[0], 1.0), (m.y[1], None)])
+        m.unknown_parameters = pyo.Suffix(direction=pyo.Suffix.LOCAL)
+        m.measurement_error = pyo.Suffix(direction=pyo.Suffix.LOCAL)
+        m.measurement_error.update([(m.y[0], 1.0), (m.y[1], 1.0)])
+
+        with self.assertRaisesRegex(ValueError, r"\['y\[1\]'\]"):
+            parmest.SSE_weighted(m)
+
     def test_invalid_solver_name_raises_runtimeerror(self):
         pest = _build_estimator([(1.0, 2.0), (2.0, 4.0)])
 

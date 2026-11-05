@@ -95,6 +95,9 @@ def SSE(model):
     # check if the model has all the required suffixes
     _check_model_labels(model)
 
+    # check that no measured value is missing
+    _check_experiment_output_values(model)
+
     # SSE between the prediction and observation of the measured variables
     expr = (1 / 2) * sum(
         (y - y_hat) ** 2 for y_hat, y in model.experiment_outputs.items()
@@ -115,6 +118,9 @@ def SSE_weighted(model):
     """
     # check if the model has all the required suffixes
     _check_model_labels(model)
+
+    # check that no measured value is missing
+    _check_experiment_output_values(model)
 
     # Check that measurement errors exist
     if not hasattr(model, "measurement_error"):
@@ -352,6 +358,30 @@ def _check_model_labels(model):
         )
 
     logger.info("Model has expected labels.")
+
+
+def _check_experiment_output_values(model):
+    """
+    Checks that every measured value in the "experiment_outputs" suffix is
+    present. A missing value (None or NaN) would otherwise reach the solver
+    and fail without naming the data point.
+
+    Parameters
+    ----------
+    model : ConcreteModel
+        Annotated Pyomo model
+    """
+    missing = [
+        y_hat.name
+        for y_hat, y in model.experiment_outputs.items()
+        if y is None or (isinstance(y, float) and np.isnan(y))
+    ]
+    if missing:
+        raise ValueError(
+            f"Experiment outputs have missing measured values (None or NaN): "
+            f"{missing}. Remove the missing data points from the "
+            f'"experiment_outputs" suffix instead of passing missing values.'
+        )
 
 
 def _get_labeled_model(experiment):
