@@ -2307,6 +2307,32 @@ class TestParmestBlockEF(unittest.TestCase):
         self.assertAlmostEqual(obj, 0.125, places=7)
 
     @unittest.skipIf(not ipopt_available, "The 'ipopt' solver is not available")
+    def test_theta_est_stores_solver_results(self):
+        pest = _build_estimator([(1.0, 2.0), (2.0, 4.0)])
+
+        pest.theta_est()
+
+        self.assertEqual(
+            pest.solver_results.solver.termination_condition,
+            pyo.TerminationCondition.optimal,
+        )
+
+    @unittest.skipIf(not ipopt_available, "The 'ipopt' solver is not available")
+    def test_theta_est_stores_solver_results_when_not_optimal(self):
+        exp_list = [LinearThetaExperiment(x=x, y=y) for x, y in [(1.0, 2.0)]]
+        pest = parmest.Estimator(
+            exp_list, obj_function="SSE", solver_options={"max_iter": 0}
+        )
+
+        with self.assertRaises(RuntimeError):
+            pest.theta_est()
+
+        self.assertEqual(
+            pest.solver_results.solver.termination_condition,
+            pyo.TerminationCondition.maxIterations,
+        )
+
+    @unittest.skipIf(not ipopt_available, "The 'ipopt' solver is not available")
     def test_q_opt_returns_requested_values(self):
         pest = _build_estimator([(1.0, 2.0), (2.0, 4.0)])
 
