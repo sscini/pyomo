@@ -18,6 +18,7 @@ Functionality in parmest includes:
 * Leave-N-out cross validation
 * Regularization for objective function improvement
 * Multi-start initialization optimization
+* Global sensitivity analysis (PRCC, Morris method, and Sobol' indices)
 * Parallel processing
 
 Background

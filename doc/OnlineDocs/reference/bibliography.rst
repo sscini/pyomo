@@ -112,6 +112,11 @@ Bibliography
 
 .. [GAMS] http://www.gams.com
 
+.. [Gas26] K. I. Gasior. "Determining parameter impact in systems
+   biology models via sensitivity analysis: a comparative approach",
+   *npj Systems Biology and Applications*, 12, 143, 2026.
+   https://doi.org/10.1038/s41540-026-00757-5
+
 .. [GLM99] A. Grothey, S. Leyffer, and K. I. M. McKinnon.  "A note
    on feasibility in Benders Decomposition", Numerical Analysis Report
    NA/188, Dundee University. 1999.
@@ -148,6 +153,15 @@ Bibliography
    `10.1016/j.patter.2025.101311
    <https://doi.org/10.1016/j.patter.2025.101311>`_
 
+.. [MHR+08] S. Marino, I. B. Hogue, C. J. Ray, and D. E. Kirschner.
+   "A methodology for performing global uncertainty and sensitivity
+   analysis in systems biology", *Journal of Theoretical Biology*,
+   254(1):178-196, 2008. https://doi.org/10.1016/j.jtbi.2008.04.011
+
+.. [Morris91] M. D. Morris. "Factorial sampling plans for preliminary
+   computational experiments", *Technometrics*, 33(2):161-174, 1991.
+   https://doi.org/10.1080/00401706.1991.10484804
+
 .. [NW88] G. L. Nemhauser and L. A. Wolsey. *Integer and combinatorial
    optimization*, New York: Wiley. 1988.
 
@@ -160,6 +174,12 @@ Bibliography
    Chemical Engineering*, 18(7), 563–578. 1994.  DOI
    `10.1016/0098-1354(93)E0010-7
    <https://doi.org/10.1016/0098-1354(93)E0010-7>`_
+
+.. [SAA+10] A. Saltelli, P. Annoni, I. Azzini, F. Campolongo, M. Ratto,
+   and S. Tarantola. "Variance based sensitivity analysis of model
+   output. Design and estimator for the total sensitivity index",
+   *Computer Physics Communications*, 181(2):259-270, 2010.
+   https://doi.org/10.1016/j.cpc.2009.09.018
 
 .. [SG03] N. W. Sawaya and I. E. Grossmann.  "A cutting plane
    method for solving linear generalized disjunctive programming
