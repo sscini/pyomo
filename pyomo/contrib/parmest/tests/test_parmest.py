@@ -1870,6 +1870,51 @@ class TestRegularizationCore(unittest.TestCase):
             atol=1e-12,
         )
 
+    def test_compute_covariance_matrix_singular_fim_raises(self):
+        # theta0 and theta1 enter only as theta0 + theta1, so the FIM is
+        # singular and the error names both parameters
+        exp_list = [self.DummyExperiment()]
+
+        def fake_finite_difference_FIM(*args, **kwargs):
+            return np.array([[1.0, 1.0], [1.0, 1.0]])
+
+        theta_vals = {"theta0": 0.0, "theta1": 0.0}
+
+        original_finite_difference_FIM = parmest._finite_difference_FIM
+        try:
+            parmest._finite_difference_FIM = fake_finite_difference_FIM
+            with self.assertRaisesRegex(
+                RuntimeError, r"FIM is singular \(rank 1 of 2\).*theta0.*theta1"
+            ):
+                parmest.compute_covariance_matrix(
+                    experiment_list=exp_list,
+                    method=parmest.CovarianceMethod.finite_difference.value,
+                    obj_function=parmest.SSE,
+                    theta_vals=theta_vals,
+                    step=1e-3,
+                    solver="ipopt",
+                    tee=False,
+                )
+
+            # prior information on theta1 makes the FIM nonsingular
+            prior_fim = pd.DataFrame([[1.0]], index=["theta1"], columns=["theta1"])
+            cov = parmest.compute_covariance_matrix(
+                experiment_list=exp_list,
+                method=parmest.CovarianceMethod.finite_difference.value,
+                obj_function=parmest.SSE_weighted,
+                theta_vals=theta_vals,
+                step=1e-3,
+                solver="ipopt",
+                tee=False,
+                prior_FIM=prior_fim,
+            )
+        finally:
+            parmest._finite_difference_FIM = original_finite_difference_FIM
+
+        np.testing.assert_allclose(
+            cov.values, np.linalg.inv(np.array([[1.0, 1.0], [1.0, 2.0]]))
+        )
+
     def test_compute_covariance_matrix_reorders_prior_fim_by_parameter_name(self):
         exp_list = [self.DummyExperiment()]
 
