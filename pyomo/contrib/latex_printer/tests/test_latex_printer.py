@@ -17,6 +17,8 @@ import pyomo.environ as pyo
 from pyomo.contrib.latex_printer import latex_printer
 from pyomo.common.tempfiles import TempfileManager
 from pyomo.common.collections.component_map import ComponentMap
+from pyomo.common.log import LoggingIntercept
+from pyomo.dae import ContinuousSet, DerivativeVar
 from pyomo.environ import (
     Reals,
     PositiveReals,
@@ -580,6 +582,55 @@ class TestLatexPrinter(unittest.TestCase):
         """)
         self.assertEqual('\n' + pstr + '\n', bstr)
 
+    def test_latexPrinter_componentMapNotModified(self):
+        m = pyo.ConcreteModel(name='basicFormulation')
+        m.x = pyo.Var()
+        m.y = pyo.Var()
+        m.c = pyo.Param(initialize=1.0, mutable=True)
+        m.constraint = pyo.Constraint(expr=m.x + m.y <= m.c)
+        lcm = ComponentMap()
+        lcm[m.x] = '\\alpha'
+        pstr = latex_printer(m.constraint, latex_component_map=lcm)
+        bstr = dedent(r"""
+        \begin{equation} 
+             \alpha + y \leq c 
+        \end{equation} 
+        """)
+        self.assertEqual('\n' + pstr + '\n', bstr)
+        self.assertEqual(list(lcm.items()), [(m.x, '\\alpha')])
+
+    def test_latexPrinter_componentMapUnusedComponents(self):
+        m = pyo.ConcreteModel(name='basicFormulation')
+        m.x = pyo.Var()
+        m.y = pyo.Var()
+        m.z = pyo.Var()
+        m.a = pyo.Param(initialize=1.0, mutable=True)
+        m.b = pyo.Param(initialize=1.0, mutable=True)
+        m.constraint_1 = pyo.Constraint(expr=m.x + m.y <= m.a)
+        m.constraint_2 = pyo.Constraint(expr=m.y + m.z <= m.b)
+        lcm = ComponentMap()
+        lcm[m.x] = '\\alpha'
+        lcm[m.y] = '\\beta'
+        lcm[m.z] = '\\gamma'
+        lcm[m.a] = 'A'
+        lcm[m.b] = 'B'
+
+        pstr = latex_printer(m.constraint_1, latex_component_map=lcm)
+        bstr = dedent(r"""
+        \begin{equation} 
+             \alpha + \beta \leq A 
+        \end{equation} 
+        """)
+        self.assertEqual('\n' + pstr + '\n', bstr)
+
+        pstr = latex_printer(m.constraint_2, latex_component_map=lcm)
+        bstr = dedent(r"""
+        \begin{equation} 
+             \beta + \gamma \leq B 
+        \end{equation} 
+        """)
+        self.assertEqual('\n' + pstr + '\n', bstr)
+
     def test_latexPrinter_equationEnvironment(self):
         m = pyo.ConcreteModel(name='basicFormulation')
         m.x = pyo.Var()
@@ -767,6 +818,67 @@ class TestLatexPrinter(unittest.TestCase):
 \end{align}
             """.strip(),
         )
+
+    def test_latexPrinter_derivativeVar(self):
+        m = pyo.ConcreteModel(name='basicFormulation')
+        m.t = ContinuousSet(bounds=(0, 1))
+        m.k = pyo.Param(initialize=-1.0, mutable=True)
+        m.x = pyo.Var(m.t)
+        m.dxdt = DerivativeVar(m.x, wrt=m.t)
+
+        def ruleMaker(m, t):
+            return m.dxdt[t] == m.k * m.x[t]
+
+        m.ode = pyo.Constraint(m.t, rule=ruleMaker)
+
+        pstr = latex_printer(m.ode)
+        bstr = dedent(r"""
+        \begin{equation} 
+             \frac{d x}{d t}_{i} = k x_{i}  \qquad \forall i \in t 
+        \end{equation} 
+        """)
+        self.assertEqual('\n' + pstr + '\n', bstr)
+
+        pstr = latex_printer(m)
+        bstr = dedent(r"""
+        \begin{align} 
+            & \text{s.t.} 
+            & & \frac{d x}{d t}_{i} = k x_{i} &  \qquad \forall i \in t \label{con:basicFormulation_ode} 
+        \end{align} 
+        """)
+        self.assertEqual('\n' + pstr + '\n', bstr)
+
+        # The discretization equations cannot be templatized (which is logged),
+        # so they are printed individually
+        pyo.TransformationFactory('dae.finite_difference').apply_to(m, nfe=2, wrt=m.t)
+        with LoggingIntercept():
+            pstr = latex_printer(m)
+        self.assertIn(
+            r'& & \frac{d x}{d t}_{i} = k x_{i} &  \qquad \forall i \in t '
+            r'\label{con:basicFormulation_ode}',
+            pstr,
+        )
+
+    def test_latexPrinter_derivativeVarHigherOrder(self):
+        m = pyo.ConcreteModel(name='basicFormulation')
+        m.t = ContinuousSet(bounds=(0, 1))
+        m.z = ContinuousSet(bounds=(0, 1))
+        m.u = pyo.Var(m.t, m.z)
+        m.dudt = DerivativeVar(m.u, wrt=m.t)
+        m.d2udz2 = DerivativeVar(m.u, wrt=(m.z, m.z))
+
+        def ruleMaker(m, t, z):
+            return m.dudt[t, z] == m.d2udz2[t, z]
+
+        m.pde = pyo.Constraint(m.t, m.z, rule=ruleMaker)
+
+        pstr = latex_printer(m.pde)
+        bstr = dedent(r"""
+        \begin{equation} 
+             \frac{\partial u}{\partial t}_{i,j} = \frac{\partial^{2} u}{\partial z^{2}}_{i,j}  \qquad \forall i,j \in t \times z 
+        \end{equation} 
+        """)
+        self.assertEqual('\n' + pstr + '\n', bstr)
 
 
 if __name__ == '__main__':

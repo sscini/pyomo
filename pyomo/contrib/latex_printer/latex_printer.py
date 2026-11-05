@@ -58,6 +58,7 @@ from pyomo.core.expr.template_expr import (
 )
 from pyomo.core.expr.numeric_expr import NPV_SumExpression, NPV_DivisionExpression
 from pyomo.core.base.block import IndexedBlock
+from pyomo.dae import ContinuousSet, DerivativeVar
 
 from pyomo.core.base.external import _PythonCallbackFunctionID
 from pyomo.core.base.enums import SortComponents
@@ -410,6 +411,7 @@ class _LatexVisitor(StreamBasedExpressionVisitor):
             SumExpression: handle_sumExpression_node,
             MonomialTermExpression: handle_monomialTermExpression_node,
             IndexedVar: handle_var_node,
+            DerivativeVar: handle_var_node,
             IndexTemplate: handle_indexTemplate_node,
             Numeric_GetItemExpression: handle_numericGetItemExpression_node,
             TemplateSumExpression: handle_templateSumExpression_node,
@@ -565,6 +567,36 @@ def analyze_variable(vr):
     return varBoundData
 
 
+def generate_derivative_name(dv):
+    # Default name for a DerivativeVar, ex: \frac{d x}{d t} or \frac{d^{2} x}{d t^{2}}
+    stateVar = dv.get_state_var()
+    wrtSets = dv.get_continuousset_list()
+
+    # Use partial derivatives if the state is indexed by more than one ContinuousSet
+    continuousSets = [
+        st for st in stateVar.index_set().subsets() if isinstance(st, ContinuousSet)
+    ]
+    if len(continuousSets) > 1:
+        dSymbol = '\\partial'
+    else:
+        dSymbol = 'd'
+
+    numerator = dSymbol
+    if len(wrtSets) > 1:
+        numerator += '^{%d}' % (len(wrtSets))
+    numerator += ' ' + stateVar.name
+
+    denominator = []
+    for st in ComponentSet(wrtSets):
+        order = sum(1 for w in wrtSets if w is st)
+        if order > 1:
+            denominator.append('%s %s^{%d}' % (dSymbol, st.name, order))
+        else:
+            denominator.append('%s %s' % (dSymbol, st.name))
+
+    return '\\frac{%s}{%s}' % (numerator, ' '.join(denominator))
+
+
 def multiple_replace(pstr, rep_dict):
     pattern = re.compile("|".join(rep_dict.keys()), flags=re.DOTALL)
     return pattern.sub(lambda x: rep_dict[x.group(0)], pstr)
@@ -635,6 +667,8 @@ def latex_printer(
         latex_component_map = ComponentMap()
         existing_components = ComponentSet()
     else:
+        # Copy so that the defaults added below do not modify the caller's map
+        latex_component_map = ComponentMap(latex_component_map)
         existing_components = ComponentSet(latex_component_map)
 
     isSingle = False
@@ -702,7 +736,9 @@ def latex_printer(
     if isSingle:
         temp_comp, temp_indexes = templatize_fcn(pyomo_component)
         variableList = []
-        for v in identify_components(temp_comp, [ScalarVar, VarData, IndexedVar]):
+        for v in identify_components(
+            temp_comp, [ScalarVar, VarData, IndexedVar, DerivativeVar]
+        ):
             if isinstance(v, VarData):
                 v_write = v.parent_component()
                 if v_write not in ComponentSet(variableList):
@@ -728,7 +764,7 @@ def latex_printer(
         variableList = [
             vr
             for vr in pyomo_component.component_objects(
-                pyo.Var,
+                (pyo.Var, DerivativeVar),
                 descend_into=True,
                 active=True,
                 sort=SortComponents.deterministic,
@@ -779,7 +815,7 @@ def latex_printer(
         vrIdx += 1
         if isinstance(vr, ScalarVar):
             variableMap[vr] = 'x_' + str(vrIdx) + '_'
-        elif isinstance(vr, IndexedVar):
+        elif isinstance(vr, (IndexedVar, DerivativeVar)):
             variableMap[vr] = 'x_' + str(vrIdx) + '_'
             for sd in vr.index_set().data():
                 vrIdx += 1
@@ -956,7 +992,7 @@ def latex_printer(
             if isinstance(vr, ScalarVar):
                 varBoundDataEntry = analyze_variable(vr)
                 varBoundData.append(varBoundDataEntry)
-            elif isinstance(vr, IndexedVar):
+            elif isinstance(vr, (IndexedVar, DerivativeVar)):
                 varBoundData_indexedVar = []
                 setData = vr.index_set().data()
                 for sd in setData:
@@ -1226,8 +1262,11 @@ def latex_printer(
     for i, vr in enumerate(variableList):
         if isinstance(vr, ScalarVar):
             new_variableMap[vr] = vr.name
-        elif isinstance(vr, IndexedVar):
-            new_variableMap[vr] = vr.name
+        elif isinstance(vr, (IndexedVar, DerivativeVar)):
+            if isinstance(vr, DerivativeVar):
+                new_variableMap[vr] = generate_derivative_name(vr)
+            else:
+                new_variableMap[vr] = vr.name
             for sd in vr.index_set().data():
                 sdString = str(sd)
                 if sdString[0] == '(':
@@ -1269,11 +1308,17 @@ def latex_printer(
     rep_dict = {}
     for ky in reversed(list(latex_component_map)):
         if isinstance(ky, (pyo.Var, VarData)):
+            if ky not in variableMap:
+                # The map may name variables that this component does not use
+                continue
             overwrite_value = latex_component_map[ky]
             if ky not in existing_components:
                 overwrite_value = overwrite_value.replace('_', '\\_')
             rep_dict[variableMap[ky]] = overwrite_value
         elif isinstance(ky, (pyo.Param, ParamData)):
+            if ky not in parameterMap:
+                # The map may name parameters that this component does not use
+                continue
             overwrite_value = latex_component_map[ky]
             if ky not in existing_components:
                 overwrite_value = overwrite_value.replace('_', '\\_')
