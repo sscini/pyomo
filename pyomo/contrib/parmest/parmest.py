@@ -1453,7 +1453,9 @@ class Estimator:
         model = self._create_parmest_model(experiment_number)
         return model
 
-    def _create_scenario_blocks(self, bootlist=None, theta_vals=None, fix_theta=False):
+    def _create_scenario_blocks(
+        self, bootlist=None, theta_vals=None, fix_theta=False, fixed_theta_values=None
+    ):
         """
         Create scenario blocks for parameter estimation.
 
@@ -1468,6 +1470,13 @@ class Estimator:
         fix_theta : bool, optional
             If True, fix the theta values in the model. If False, leave them free.
             Default is False.
+        fixed_theta_values : dict, optional
+            Dictionary of values keyed by theta name for thetas to fix at those
+            values while the other thetas stay free (used by
+            profile_likelihood). These values take precedence over theta_vals.
+            Fixed thetas are not linked to the parent theta variables.
+            Default is None.
+
         Returns
         -------
         model : ConcreteModel
@@ -1488,6 +1497,9 @@ class Estimator:
         # they serve as user-facing labels and result keys.
         model.parmest_theta = pyo.Var(model._parmest_theta_names)
 
+        if fixed_theta_values is None:
+            fixed_theta_values = {}
+
         # Initialize parent/global theta values from the template model.
         for name, cuid in zip(expanded_theta_names, expanded_theta_cuids):
             template_theta_var = cuid.find_component_on(template_model)
@@ -1505,7 +1517,9 @@ class Estimator:
             else:
                 parent_theta_var.set_value(pyo.value(template_theta_var))
 
-            if fix_theta:
+            if name in fixed_theta_values:
+                parent_theta_var.fix(fixed_theta_values[name])
+            elif fix_theta:
                 parent_theta_var.fix()
             else:
                 parent_theta_var.unfix()
@@ -1560,7 +1574,7 @@ class Estimator:
 
                 child_theta_var.set_value(theta_value)
 
-                if fix_theta:
+                if fix_theta or name in fixed_theta_values:
                     child_theta_var.fix()
                 else:
                     child_theta_var.unfix()
@@ -1733,6 +1747,7 @@ class Estimator:
         theta_vals=None,
         fix_theta=False,
         multistart=False,
+        fixed_theta_values=None,
     ):
         """
         _Q_opt method for parameter estimation using an extensive form
@@ -1770,6 +1785,11 @@ class Estimator:
         multistart : bool, optional
             If True, return the termination condition, and return None values
             instead of raising if the solve is not optimal. Default is False.
+        fixed_theta_values : dict, optional
+            Dictionary keyed by theta name of thetas to fix while the other
+            thetas are estimated (used by profile_likelihood); see
+            _create_scenario_blocks. If given, the solve is handled as with
+            multistart=True. Default is None.
 
         Returns
         -------
@@ -1782,8 +1802,8 @@ class Estimator:
             theta values. If the fixed-theta problem does not return a
             solution, obj_value is None.
 
-            If multistart is True and the solve is not optimal, obj_value is
-            None.
+            If multistart is True or fixed_theta_values is given and the
+            solve is not optimal, obj_value is None.
         theta_estimates : dict or None
             Dictionary of theta values keyed by theta name.
 
@@ -1793,22 +1813,26 @@ class Estimator:
             If fix_theta is True, this contains the fixed theta values used in
             the model.
 
-            If multistart is True and the solve is not optimal,
-            theta_estimates is None.
+            If multistart is True or fixed_theta_values is given and the
+            solve is not optimal, theta_estimates is None.
         var_values : pd.DataFrame, optional
             DataFrame of variable values for the variables specified in
             return_values. Only returned when fix_theta and multistart are
-            False and return_values is not None and contains at least one valid
-            variable name. The DataFrame has one row per scenario block and
-            columns corresponding to the variable names in return_values.
+            False, fixed_theta_values is not given, and return_values is not
+            None and contains at least one valid variable name. The DataFrame
+            has one row per scenario block and columns corresponding to the
+            variable names in return_values.
         termination_condition : pyomo.opt.TerminationCondition, optional
             Solver termination condition. Only returned when fix_theta or
-            multistart is True.
+            multistart is True, or fixed_theta_values is given.
 
         """
         # Create extended form model with scenario blocks
         model = self._create_scenario_blocks(
-            bootlist=bootlist, theta_vals=theta_vals, fix_theta=fix_theta
+            bootlist=bootlist,
+            theta_vals=theta_vals,
+            fix_theta=fix_theta,
+            fixed_theta_values=fixed_theta_values,
         )
         expanded_theta_names = list(model._parmest_theta_names)
 
@@ -1847,10 +1871,13 @@ class Estimator:
             obj_value = None
             return obj_value, theta_estimates, termination_condition
 
+        partial_fix_mode = bool(fixed_theta_values)
+
         # If not fixing theta, a non-optimal solve raises, or in multistart
-        # mode returns only the termination condition
+        # and partial-fix (profile likelihood) modes returns only the
+        # termination condition
         if not fix_theta and not check_optimal_termination(solve_result):
-            if multistart:
+            if multistart or partial_fix_mode:
                 return None, None, termination_condition
             assert_optimal_termination(solve_result)
 
@@ -1866,9 +1893,9 @@ class Estimator:
         self.obj_value = obj_value
         self.estimated_theta = theta_estimates
 
-        # If fixing theta or multistart, return objective value, theta
-        # estimates, and solver status
-        if fix_theta or multistart:
+        # If fixing theta, in multistart mode, or fixing some thetas, return
+        # objective value, theta estimates, and solver status
+        if fix_theta or multistart or partial_fix_mode:
             return obj_value, theta_estimates, termination_condition
 
         # Extract return values if requested
@@ -2595,11 +2622,7 @@ class Estimator:
         multistart_result = _build_multistart_table(theta_starts)
 
         # _Q_opt overwrites these; restore them if no start is optimal
-        state_attrs = ("ef_instance", "estimated_theta", "obj_value")
-        prior_state = {}
-        for attr in state_attrs:
-            if hasattr(self, attr):
-                prior_state[attr] = getattr(self, attr)
+        prior_state = self._save_estimation_state()
 
         # Best optimal start so far. Non-optimal objectives (e.g., at
         # infeasible points) are not comparable, so only optimal starts count.
@@ -2636,11 +2659,7 @@ class Estimator:
             logger.warning(
                 f"None of the {len(theta_starts)} starts terminated optimally."
             )
-            for attr in state_attrs:
-                if attr in prior_state:
-                    setattr(self, attr, prior_state[attr])
-                elif hasattr(self, attr):
-                    delattr(self, attr)
+            self._restore_estimation_state(prior_state)
         else:
             # Keep the best start's solution (e.g., for cov_est)
             self.ef_instance = best_model
@@ -2651,6 +2670,534 @@ class Estimator:
             multistart_result.to_csv(file_name, index=False)
 
         return multistart_result, best_theta, best_obj
+
+    def _build_profile_grid(self, profiled_theta, grid, n_grid, model):
+        """
+        Validate the grid values of one profiled theta, or build n_grid evenly
+        spaced values between its bounds in model if grid is None.
+        """
+        if grid is not None and not isinstance(
+            grid, (list, tuple, np.ndarray, pd.Series)
+        ):
+            raise TypeError("grid must be a sequence of numeric values or None.")
+
+        if grid is None:
+            theta_var = model.find_component(profiled_theta)
+            if theta_var.lb is None or theta_var.ub is None:
+                raise ValueError(
+                    f"Cannot auto-build grid for '{profiled_theta}' without lower "
+                    f"and upper bounds."
+                )
+            return np.linspace(theta_var.lb, theta_var.ub, n_grid)
+
+        values = np.asarray(grid, dtype=float)
+        if values.size == 0:
+            raise ValueError("Provided grid must contain at least one value.")
+        return values
+
+    def _split_grid_at_center(self, grid_values, center):
+        """
+        Split profile grid values at the value closest to center, for
+        continuation warm starts.
+
+        Parameters
+        ----------
+        grid_values: list of float
+            Sorted grid values of the profiled theta.
+        center: float
+            Value of the profiled theta at the baseline estimate.
+
+        Returns
+        -------
+        branches: list of list
+            Values from the closest grid value upward, then (if any) the values
+            below it in decreasing order, so each branch moves away from center.
+        """
+        # Grid values are rounded, so center may not be in the grid exactly
+        pivot = min(grid_values, key=lambda v: abs(v - center))
+        upper = [v for v in grid_values if v >= pivot]
+        lower = [v for v in reversed(grid_values) if v < pivot]
+        if lower:
+            return [upper, lower]
+        return [upper]
+
+    def _profile_lr_stat(self, obj, obj_hat):
+        """
+        Likelihood ratio statistic of profile objective values (see
+        profile_likelihood). Logs a warning and returns NaN where it is not
+        defined.
+        """
+        obj = np.asarray(obj, dtype=float)
+        if self.regularization is not None or not isinstance(
+            self.obj_function, ObjectiveType
+        ):
+            logger.warning(
+                "profile_likelihood: lr_stat is only defined for the 'SSE' and "
+                "'SSE_weighted' objectives without regularization, so it is "
+                "set to NaN."
+            )
+            return np.full(obj.shape, np.nan)
+
+        # The objective is half the weighted SSE averaged over the S
+        # experiments, so 2 * S * obj is the weighted SSE
+        if self.obj_function == ObjectiveType.SSE_weighted:
+            return 2.0 * len(self.exp_list) * (obj - obj_hat)
+
+        # SSE: the variance is profiled out, and the likelihood is unbounded
+        # at a perfect fit
+        if obj_hat <= 0:
+            logger.warning(
+                "profile_likelihood: the baseline objective is zero (a perfect "
+                "fit), so lr_stat is not defined for the 'SSE' objective and "
+                "is set to NaN."
+            )
+            return np.full(obj.shape, np.nan)
+        # One residual per experiment output
+        n_residuals = 0
+        for exp in self.exp_list:
+            n_residuals += len(_get_labeled_model(exp).experiment_outputs)
+        return n_residuals * np.log(obj / obj_hat)
+
+    def _profile_intervals(self, profiles, profiled_theta_list, theta_hat, thresholds):
+        """
+        Profile confidence interval of each theta (see profile_likelihood).
+
+        Parameters
+        ----------
+        profiles: pd.DataFrame
+            Profiles indexed by profiled theta and value, with an lr_stat
+            column (NaN where the solve failed).
+        profiled_theta_list: list of str
+            Names of the profiled thetas.
+        theta_hat: dict
+            Baseline theta values keyed by theta name.
+        thresholds: dict
+            Chi-square threshold of lr_stat keyed by alpha.
+
+        Returns
+        -------
+        intervals: pd.DataFrame
+            One row per profiled theta and alpha (see profile_likelihood).
+        """
+        rows = []
+        for pname in profiled_theta_list:
+            prof = profiles.loc[pname]
+            # Failed solves (and undefined lr_stat) have no value to compare
+            prof = prof[prof["lr_stat"].notna()]
+            values = prof.index.to_numpy(dtype=float)
+            lr = prof["lr_stat"].to_numpy(dtype=float)
+            for alpha, threshold in thresholds.items():
+                bounds = {"lower": np.nan, "upper": np.nan}
+                if len(values) > 0:
+                    # Walk outward from the grid value closest to theta_hat
+                    # until lr_stat reaches the threshold
+                    center = int(np.argmin(np.abs(values - theta_hat[pname])))
+                    # If theta_hat is not inside the region, there is no
+                    # interval around it
+                    if lr[center] < threshold:
+                        for side, step in (("lower", -1), ("upper", 1)):
+                            inside = center
+                            while 0 <= inside + step < len(values):
+                                outside = inside + step
+                                if lr[outside] >= threshold:
+                                    # Linear interpolation of the crossing
+                                    slope = (values[outside] - values[inside]) / (
+                                        lr[outside] - lr[inside]
+                                    )
+                                    bounds[side] = (
+                                        values[inside]
+                                        + (threshold - lr[inside]) * slope
+                                    )
+                                    break
+                                inside = outside
+                rows.append(
+                    {
+                        "profiled_theta": pname,
+                        "alpha": alpha,
+                        "theta_hat": theta_hat[pname],
+                        "lower": bounds["lower"],
+                        "upper": bounds["upper"],
+                        "threshold": threshold,
+                        "lower_bounded": not np.isnan(bounds["lower"]),
+                        "upper_bounded": not np.isnan(bounds["upper"]),
+                    }
+                )
+        return pd.DataFrame(rows).set_index(["profiled_theta", "alpha"])
+
+    def _profile_sweep(
+        self,
+        profiled_theta_list,
+        grids,
+        theta_hat,
+        warmstart,
+        max_consecutive_failures,
+        return_theta_paths,
+    ):
+        """
+        Solve every grid value of each profiled theta (see profile_likelihood),
+        with grids keyed by profiled theta name.
+
+        Returns
+        -------
+        rows: list of dict
+            One row of the profiles DataFrame per grid value solved.
+        best_obj: float or None
+            Lowest objective value of the successful solves (None if every
+            solve failed).
+        best_theta: dict or None
+            Estimated value of every theta at best_obj.
+        """
+        rows = []
+        best_obj = None
+        best_theta = None
+        for pname in profiled_theta_list:
+            # The theta_hat value is always solved, so each profile includes
+            # the baseline; np.unique also sorts
+            grid_values = np.append(grids[pname], theta_hat[pname])
+            grid_values = np.unique(np.round(grid_values, decimals=14)).tolist()
+
+            # "neighbor" solves each side outward from theta_hat, so every
+            # solve starts close to the previous solution
+            if warmstart == "neighbor":
+                branches = self._split_grid_at_center(
+                    grid_values, center=theta_hat[pname]
+                )
+            else:
+                branches = [grid_values]
+
+            # Solution at the first value solved (closest to theta_hat),
+            # used to start the second side
+            center_theta = theta_hat
+            center_value = branches[0][0]
+            for branch in branches:
+                previous_theta = center_theta
+                consecutive_failures = 0
+
+                for value in branch:
+                    # Start the other thetas from the previous solution, with
+                    # the profiled theta at this grid value
+                    init_theta = dict(previous_theta)
+                    init_theta[pname] = value
+
+                    t0 = time.time()
+                    try:
+                        obj_val, theta_conv, term = self._Q_opt(
+                            theta_vals=init_theta, fixed_theta_values={pname: value}
+                        )
+                        status = str(term)
+                    except Exception as exc:
+                        theta_conv = None
+                        status = f"exception: {exc}"
+
+                    # theta_conv is None unless the solve terminated optimally
+                    success = theta_conv is not None
+                    if success:
+                        consecutive_failures = 0
+                        if warmstart == "neighbor":
+                            previous_theta = theta_conv
+                            if value == center_value:
+                                center_theta = theta_conv
+                        # Track the lowest objective to check the baseline
+                        if best_obj is None or obj_val < best_obj:
+                            best_obj = obj_val
+                            best_theta = dict(theta_conv)
+                    else:
+                        obj_val = np.nan
+                        consecutive_failures += 1
+
+                    row = {
+                        "profiled_theta": pname,
+                        "theta_value": value,
+                        "obj": obj_val,
+                        "status": status,
+                        "success": success,
+                        "solve_time": time.time() - t0,
+                    }
+                    if return_theta_paths and success:
+                        for tname, tval in theta_conv.items():
+                            row[tname] = tval
+                    rows.append(row)
+
+                    # Stop this side of the profile (the other side is
+                    # still solved)
+                    if (
+                        max_consecutive_failures is not None
+                        and consecutive_failures >= max_consecutive_failures
+                    ):
+                        break
+        return rows, best_obj, best_theta
+
+    def profile_likelihood(
+        self,
+        profiled_theta,
+        alphas=None,
+        grid=None,
+        n_grid=21,
+        theta_hat=None,
+        obj_hat=None,
+        use_multistart_for_baseline=False,
+        baseline_multistart_kwargs=None,
+        warmstart="neighbor",
+        max_consecutive_failures=None,
+        return_theta_paths=True,
+        max_rebaseline=0,
+    ):
+        """
+        Profile likelihood for one or more thetas, fixing each profiled theta
+        at a grid of values and re-estimating the other thetas
+
+        Each grid value is solved as in theta_est. If a solve finds a lower
+        objective than obj_hat, a warning is logged and that solution becomes
+        the baseline. The Estimator keeps the estimate it held before the call
+        (or the baseline estimate, if it is computed here), even if a lower
+        objective is found.
+
+        Parameters
+        ----------
+        profiled_theta: str or list of str
+            Name(s) of the theta(s) to profile, as returned by theta_est. Each
+            theta is profiled separately.
+        alphas: list of float, optional
+            Confidence levels (between 0 and 1) of the profile confidence
+            intervals. Default is None ([0.95]).
+        grid: list, np.ndarray, pd.Series, dict or None, optional
+            Values of the profiled theta, or a dict of values keyed by theta
+            name. If None (or a theta is missing from the dict), n_grid evenly
+            spaced values between the theta bounds are used. The theta_hat
+            value is always added. Default is None.
+        n_grid: int, optional
+            Number of grid values (at least 2) for a grid built from the theta
+            bounds. Default is 21.
+        theta_hat: dict, optional
+            Estimated theta values keyed by theta name. If theta_hat or obj_hat
+            is None, both are computed with theta_est (or
+            theta_est_multistart). Default is None.
+        obj_hat: float, optional
+            Objective value at theta_hat. Default is None.
+        use_multistart_for_baseline: bool, optional
+            If True, compute theta_hat and obj_hat with theta_est_multistart.
+            Default is False.
+        baseline_multistart_kwargs: dict, optional
+            Keyword arguments for theta_est_multistart. Default is None.
+        warmstart: str, optional
+            "neighbor" solves the grid values outward from theta_hat, upward
+            then downward, each starting from the last successful solution on
+            that side. "none" solves them in increasing order, each starting
+            from theta_hat. Default is "neighbor".
+        max_consecutive_failures: int, optional
+            Stop a side of theta_hat ("neighbor") or a theta ("none") after
+            this many consecutive failed solves. Default is None (no limit).
+        return_theta_paths: bool, optional
+            If True, include the estimated value of every theta at each grid
+            value (one column per theta name). Default is True.
+        max_rebaseline: int, optional
+            Maximum number of times the profiles are solved again from a new
+            baseline, when a lower objective is found. Default is 0 (the
+            baseline is updated, but the profiles are not solved again).
+
+        Returns
+        -------
+        profiles: pd.DataFrame
+            One row per grid value solved, indexed by ``profiled_theta`` and
+            ``theta_value``, with columns ``obj`` (NaN if the solve failed),
+            ``status`` (termination condition or exception message),
+            ``success``, ``solve_time`` (seconds), ``lr_stat``, one column per
+            alpha (True if lr_stat is below the threshold) and, if
+            return_theta_paths is True, one column per theta name. For S
+            experiments with N residuals, lr_stat is 2 * S * (obj - obj_hat)
+            for "SSE_weighted" and N * log(obj / obj_hat) for "SSE" (variance
+            profiled out); it is NaN for other objectives, with
+            regularization, or for "SSE" when obj_hat is 0.
+        intervals: pd.DataFrame
+            Profile confidence interval of each theta, indexed by
+            ``profiled_theta`` and ``alpha``, with columns ``theta_hat``,
+            ``lower``, ``upper``, ``threshold`` (chi-square with 1 degree of
+            freedom), ``lower_bounded`` and ``upper_bounded``. The bounds are
+            linearly interpolated where lr_stat crosses the threshold on each
+            side of theta_hat. If it does not cross within the grid, the
+            bound is NaN and the bounded column is False.
+        theta_hat: dict
+            Baseline theta values (updated if a lower objective is found).
+        obj_hat: float
+            Objective value at theta_hat.
+        """
+        if self.pest_deprecated is not None:
+            raise RuntimeError(
+                "Profile likelihood is not supported in the deprecated parmest interface."
+            )
+        if isinstance(profiled_theta, str):
+            profiled_theta_list = [profiled_theta]
+        elif isinstance(profiled_theta, (list, tuple)):
+            profiled_theta_list = list(profiled_theta)
+        else:
+            raise TypeError(
+                "profiled_theta must be a string or a list/tuple of strings."
+            )
+        if len(profiled_theta_list) == 0:
+            raise ValueError("At least one profiled theta must be provided.")
+        if not all(isinstance(p, str) for p in profiled_theta_list):
+            raise TypeError("Each profiled theta name must be a string.")
+        if len(profiled_theta_list) != len(set(profiled_theta_list)):
+            raise ValueError(
+                f"Duplicate profiled theta names are not allowed: "
+                f"{profiled_theta_list}"
+            )
+        if not isinstance(n_grid, int):
+            raise TypeError("n_grid must be an integer.")
+        if n_grid < 2:
+            raise ValueError("n_grid must be at least 2.")
+        if warmstart not in ("neighbor", "none"):
+            raise ValueError("warmstart must be either 'neighbor' or 'none'.")
+        if max_consecutive_failures is not None:
+            if not isinstance(max_consecutive_failures, int):
+                raise TypeError("max_consecutive_failures must be an integer or None.")
+            if max_consecutive_failures <= 0:
+                raise ValueError("max_consecutive_failures must be greater than zero.")
+        if not isinstance(return_theta_paths, bool):
+            raise TypeError("return_theta_paths must be a bool.")
+        if alphas is None:
+            alphas = [0.95]
+        if not isinstance(alphas, (list, tuple)) or len(alphas) == 0:
+            raise TypeError("alphas must be a non-empty list of floats.")
+        for a in alphas:
+            if not isinstance(a, (int, float)) or not 0 < a < 1:
+                raise ValueError("Each alpha must be between 0 and 1.")
+        if len(alphas) != len(set(alphas)):
+            raise ValueError(f"Duplicate alphas are not allowed: {list(alphas)}")
+        if not isinstance(max_rebaseline, int):
+            raise TypeError("max_rebaseline must be an integer.")
+        if max_rebaseline < 0:
+            raise ValueError("max_rebaseline must be non-negative.")
+
+        # Check the names against the model, before any solve
+        parmest_model = self._create_parmest_model(0)
+        theta_names, _ = self._expanded_theta_info(parmest_model)
+        unknown_requested = set(profiled_theta_list).difference(theta_names)
+        if unknown_requested:
+            raise ValueError(
+                f"Unknown profile theta name(s): {sorted(unknown_requested)}. "
+                f"Known names: {theta_names}."
+            )
+        if isinstance(grid, dict):
+            unknown_grid = set(grid).difference(profiled_theta_list)
+            if unknown_grid:
+                raise ValueError(
+                    f"grid key(s) {sorted(unknown_grid)} are not profiled "
+                    f"thetas: {profiled_theta_list}."
+                )
+        # Theta columns of profiles would overwrite these
+        reserved = {
+            "profiled_theta",
+            "theta_value",
+            "obj",
+            "status",
+            "success",
+            "solve_time",
+            "lr_stat",
+        }
+        if return_theta_paths and reserved.intersection(theta_names):
+            raise ValueError(
+                f"Theta name(s) {sorted(reserved.intersection(theta_names))} "
+                f"match profiles column names; use return_theta_paths=False."
+            )
+
+        # Check the grids before the baseline, so bad input fails before any
+        # solve
+        grids = {}
+        for pname in profiled_theta_list:
+            if isinstance(grid, dict):
+                grid_spec = grid.get(pname)
+            else:
+                grid_spec = grid
+            grids[pname] = self._build_profile_grid(
+                profiled_theta=pname, grid=grid_spec, n_grid=n_grid, model=parmest_model
+            )
+
+        # lr_stat and the warm starts are measured from the baseline
+        if theta_hat is None or obj_hat is None:
+            if use_multistart_for_baseline:
+                if baseline_multistart_kwargs is None:
+                    baseline_multistart_kwargs = {}
+                _, theta_hat, obj_hat = self.theta_est_multistart(
+                    **baseline_multistart_kwargs
+                )
+                if theta_hat is None:
+                    raise RuntimeError(
+                        "Failed to compute baseline from multistart: no feasible solution found."
+                    )
+            else:
+                obj_hat, theta_hat = self.theta_est()
+
+        # Every theta needs a baseline value to start the profile solves
+        theta_hat_df = self._normalize_theta_dataframe(
+            pd.DataFrame([theta_hat]), model=parmest_model
+        )
+        theta_hat = {k: float(v) for k, v in theta_hat_df.iloc[0].items()}
+        obj_hat = float(obj_hat)
+
+        n_rebaseline = 0
+
+        # Profile solves overwrite the estimate; restore it afterwards (e.g.,
+        # for cov_est)
+        prior_state = self._save_estimation_state()
+        try:
+            # Solve the profiles; a lower objective becomes the baseline, and
+            # the profiles are solved again up to max_rebaseline times
+            while True:
+                rows, best_obj, best_theta = self._profile_sweep(
+                    profiled_theta_list=profiled_theta_list,
+                    grids=grids,
+                    theta_hat=theta_hat,
+                    warmstart=warmstart,
+                    max_consecutive_failures=max_consecutive_failures,
+                    return_theta_paths=return_theta_paths,
+                )
+                # Relative tolerance, so solver noise does not count as a
+                # lower objective
+                if best_obj is None or best_obj >= obj_hat - 1e-8 * max(
+                    1.0, abs(obj_hat)
+                ):
+                    break
+
+                solve_again = n_rebaseline < max_rebaseline
+                if solve_again:
+                    action = "the profiles are solved again from it"
+                else:
+                    action = "lr_stat is computed from it"
+                logger.warning(
+                    f"profile_likelihood: a profile solve found a lower "
+                    f"objective ({best_obj}) than the baseline ({obj_hat}) at "
+                    f"theta = {best_theta}, so it becomes the baseline and "
+                    f"{action}. The Estimator estimate is not updated; re-run "
+                    f"theta_est from this theta to update it."
+                )
+                theta_hat = best_theta
+                obj_hat = best_obj
+                if not solve_again:
+                    break
+                n_rebaseline += 1
+        finally:
+            self._restore_estimation_state(prior_state)
+
+        # Every grid has at least the theta_hat value, so rows is not empty
+        profiles = pd.DataFrame(rows)
+        profiles = profiles.set_index(["profiled_theta", "theta_value"])
+        profiles = profiles.sort_index(kind="stable")
+        # lr_stat uses the final baseline; it and the alpha columns go after
+        # solve_time, before the theta columns
+        position = profiles.columns.get_loc("solve_time") + 1
+        lr_stat = self._profile_lr_stat(profiles["obj"], obj_hat)
+        profiles.insert(position, "lr_stat", lr_stat)
+        thresholds = {a: scipy.stats.chi2.ppf(a, df=1) for a in alphas}
+        for a in alphas:
+            position += 1
+            profiles.insert(position, a, profiles["lr_stat"] < thresholds[a])
+
+        intervals = self._profile_intervals(
+            profiles, profiled_theta_list, theta_hat, thresholds
+        )
+
+        return profiles, intervals, theta_hat, obj_hat
 
     def _normalize_theta_dataframe(self, theta_values, model=None):
         """
